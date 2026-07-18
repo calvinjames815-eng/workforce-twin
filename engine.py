@@ -260,6 +260,8 @@ class WorkforceOptimizer:
 class LivingMonteCarloSimulator:
     """
     Stateful Simulator collecting execution traces and performance summary statistics.
+    Refactored to support both sequential local runs (run_simulation) and
+    parallel fan-out across containers (run_single_trial + aggregate_trial_results).
     """
     def __init__(self, config: Any):
         if isinstance(config, dict):
@@ -268,28 +270,28 @@ class LivingMonteCarloSimulator:
             self.cfg = config
         self.master_rng = np.random.default_rng(101)
 
-    def _generate_workforce(self, num_emps: int) -> pd.DataFrame:
+    def _generate_workforce(self, rng: np.random.Generator, num_emps: int) -> pd.DataFrame:
         return pd.DataFrame({
             'emp_id': [f"E{i}" for i in range(num_emps)],
-            'role': self.master_rng.choice(['Backend Eng', 'Frontend Eng'], size=num_emps),
+            'role': rng.choice(['Backend Eng', 'Frontend Eng'], size=num_emps),
             'availability': OVERTIME_MAX_HOURS,
             'base_efficiency': 1.0,
             'efficiency': 1.0,
-            'seniority': self.master_rng.uniform(0.1, 0.7, size=num_emps),
-            'experience': self.master_rng.uniform(0.0, 3.0, size=num_emps),
+            'seniority': rng.uniform(0.1, 0.7, size=num_emps),
+            'experience': rng.uniform(0.0, 3.0, size=num_emps),
             'rolling_fatigue': 0.0
         })
 
-    def _generate_backlog(self, num_projs: int, start_idx: int = 0) -> pd.DataFrame:
+    def _generate_backlog(self, rng: np.random.Generator, num_projs: int, start_idx: int = 0) -> pd.DataFrame:
         return pd.DataFrame({
             'project_id': [f"P{i}" for i in range(start_idx, start_idx + num_projs)],
-            'required_role': self.master_rng.choice(['Backend Eng', 'Frontend Eng'], size=num_projs),
-            'min_staff': self.master_rng.integers(2, 5, size=num_projs),
-            'priority': self.master_rng.integers(1, 4, size=num_projs),
-            'urgency': self.master_rng.integers(1, 4, size=num_projs),
-            'complexity': self.master_rng.uniform(1.2, 3.0, size=num_projs),
-            'deadline_days': self.master_rng.integers(15, 60, size=num_projs),
-            'work_required': self.master_rng.uniform(100.0, 300.0, size=num_projs),
+            'required_role': rng.choice(['Backend Eng', 'Frontend Eng'], size=num_projs),
+            'min_staff': rng.integers(2, 5, size=num_projs),
+            'priority': rng.integers(1, 4, size=num_projs),
+            'urgency': rng.integers(1, 4, size=num_projs),
+            'complexity': rng.uniform(1.2, 3.0, size=num_projs),
+            'deadline_days': rng.integers(15, 60, size=num_projs),
+            'work_required': rng.uniform(100.0, 300.0, size=num_projs),
             'work_completed': 0.0,
             'delay_cycles': 0,
             'status': 'Pending'
@@ -348,142 +350,171 @@ class LivingMonteCarloSimulator:
         })
         return pd.concat([emps, new_hires], ignore_index=True)
 
-    def run_simulation(self) -> Dict[str, Any]:
-        t_sim_start = time.perf_counter()
-        
-        all_allocations = []
-        all_kpis = []
-        all_burnouts = []
-        project_history = []
-        optimizer_telemetry = []
-        
-        init_emps = self._generate_workforce(self.cfg.initial_employees)
-        init_backlog = self._generate_backlog(self.cfg.initial_projects)
+    # ==========================================
+    # PARALLEL-SAFE ENTRY POINTS
+    # ==========================================
+    def generate_trial_seeds(self) -> List[int]:
+        """Cheap, deterministic: one seed per trial. Safe to call on an orchestrator
+        without running any heavy simulation."""
+        return [int(self.master_rng.integers(1, 1_000_000)) for _ in range(self.cfg.trials)]
 
+    def run_single_trial(self, trial_number: int, trial_seed: int) -> Dict[str, Any]:
+        """
+        Executes exactly ONE trial and returns raw, JSON-serializable trial data.
+        Independent of every other trial - safe to run in its own container.
+        """
+        init_rng = np.random.default_rng(101)  # fixed -> identical starting state every trial
+        trial_emps = self._generate_workforce(init_rng, self.cfg.initial_employees)
+        trial_backlog = self._generate_backlog(init_rng, self.cfg.initial_projects)
+
+        trial_rng = np.random.default_rng(trial_seed)
         global_proj_idx = self.cfg.initial_projects
 
-        for trial in range(self.cfg.trials):
-            trial_seed = int(self.master_rng.integers(1, 1_000_000))
-            trial_rng = np.random.default_rng(trial_seed)
+        trial_kpis = []
+        trial_allocations = []
+        trial_burnouts = []
+        trial_telemetry = []
 
-            trial_emps = init_emps.copy()
-            trial_backlog = init_backlog.copy()
+        for step in range(self.cfg.steps_per_trial):
+            event = trial_rng.choice(['Normal Operations', 'Systemic Blackout', 'Crunch Culture Spike'], p=[0.75, 0.15, 0.10])
+            absence_rate = trial_rng.beta(self.cfg.absence_alpha, self.cfg.absence_beta)
+            absent_mask = trial_rng.random(len(trial_emps)) < absence_rate
 
-            for step in range(self.cfg.steps_per_trial):
-                event = trial_rng.choice(['Normal Operations', 'Systemic Blackout', 'Crunch Culture Spike'], p=[0.75, 0.15, 0.10])
-                absence_rate = trial_rng.beta(self.cfg.absence_alpha, self.cfg.absence_beta)
-                absent_mask = trial_rng.random(len(trial_emps)) < absence_rate
-                
-                active_emps = trial_emps.copy()
-                active_emps.loc[absent_mask, 'availability'] = 0.0
+            active_emps = trial_emps.copy()
+            active_emps.loc[absent_mask, 'availability'] = 0.0
 
-                if event == 'Systemic Blackout':
-                    active_emps['availability'] = (active_emps['availability'] * 0.75).round()
-                elif event == 'Crunch Culture Spike':
-                    trial_backlog['urgency'] = np.minimum(trial_backlog['urgency'] + 1, 3)
+            if event == 'Systemic Blackout':
+                active_emps['availability'] = (active_emps['availability'] * 0.75).round()
+            elif event == 'Crunch Culture Spike':
+                trial_backlog['urgency'] = np.minimum(trial_backlog['urgency'] + 1, 3)
 
-                optimizer = WorkforceOptimizer(
-                    active_emps, 
-                    trial_backlog[trial_backlog['status'] != 'Completed'],
-                    top_k_multiplier=self.cfg.top_k_multiplier
-                )
-                df_assign, completed_ids = optimizer.run_allocation(trial_seed=trial_seed + step)
+            optimizer = WorkforceOptimizer(
+                active_emps,
+                trial_backlog[trial_backlog['status'] != 'Completed'],
+                top_k_multiplier=self.cfg.top_k_multiplier
+            )
+            df_assign, completed_ids = optimizer.run_allocation(trial_seed=trial_seed + step)
 
-                if optimizer.metrics:
-                    step_metrics = optimizer.metrics.copy()
-                    step_metrics['trial'] = trial + 1
-                    step_metrics['step'] = step + 1
-                    optimizer_telemetry.append(step_metrics)
+            if optimizer.metrics:
+                step_metrics = optimizer.metrics.copy()
+                step_metrics['trial'] = trial_number + 1
+                step_metrics['step'] = step + 1
+                trial_telemetry.append(step_metrics)
 
-                if not df_assign.empty:
-                    work_done = df_assign.groupby('project_id')['effective_output_hours'].sum().to_dict()
-                    trial_backlog['work_completed'] += trial_backlog['project_id'].map(work_done).fillna(0.0)
+            if not df_assign.empty:
+                work_done = df_assign.groupby('project_id')['effective_output_hours'].sum().to_dict()
+                trial_backlog['work_completed'] += trial_backlog['project_id'].map(work_done).fillna(0.0)
 
-                    assigned_proj_ids = df_assign['project_id'].unique()
-                    delayed_mask = (~trial_backlog['project_id'].isin(assigned_proj_ids)) & (trial_backlog['status'] != 'Completed')
-                    trial_backlog.loc[delayed_mask, 'delay_cycles'] += 1
+                assigned_proj_ids = df_assign['project_id'].unique()
+                delayed_mask = (~trial_backlog['project_id'].isin(assigned_proj_ids)) & (trial_backlog['status'] != 'Completed')
+                trial_backlog.loc[delayed_mask, 'delay_cycles'] += 1
 
-                completed_mask = (trial_backlog['work_completed'] >= trial_backlog['work_required']) & (trial_backlog['status'] != 'Completed')
-                trial_backlog.loc[completed_mask, 'status'] = 'Completed'
+            completed_mask = (trial_backlog['work_completed'] >= trial_backlog['work_required']) & (trial_backlog['status'] != 'Completed')
+            trial_backlog.loc[completed_mask, 'status'] = 'Completed'
 
-                trial_backlog['deadline_days'] -= 5
-                failed_mask = (trial_backlog['deadline_days'] <= 0) & (trial_backlog['status'] != 'Completed')
-                trial_backlog.loc[failed_mask, 'status'] = 'Failed'
+            trial_backlog['deadline_days'] -= 5
+            failed_mask = (trial_backlog['deadline_days'] <= 0) & (trial_backlog['status'] != 'Completed')
+            trial_backlog.loc[failed_mask, 'status'] = 'Failed'
 
-                t_post_start = time.perf_counter()
-                trial_emps = self._process_workforce_evolution(trial_emps, df_assign, trial_rng)
+            t_post_start = time.perf_counter()
+            trial_emps = self._process_workforce_evolution(trial_emps, df_assign, trial_rng)
 
-                if step % self.cfg.hiring_interval_steps == 0:
-                    trial_emps = self._intelligent_hiring(trial_emps, trial_backlog[trial_backlog['status'] == 'Pending'], trial, step)
+            if step % self.cfg.hiring_interval_steps == 0:
+                trial_emps = self._intelligent_hiring(trial_emps, trial_backlog[trial_backlog['status'] == 'Pending'], trial_number, step)
 
-                new_projs = self._generate_backlog(self.cfg.new_projects_per_step, start_idx=global_proj_idx)
-                global_proj_idx += self.cfg.new_projects_per_step
-                trial_backlog = pd.concat([trial_backlog, new_projs], ignore_index=True)
+            new_projs = self._generate_backlog(trial_rng, self.cfg.new_projects_per_step, start_idx=global_proj_idx)
+            global_proj_idx += self.cfg.new_projects_per_step
+            trial_backlog = pd.concat([trial_backlog, new_projs], ignore_index=True)
 
-                total_capacity = active_emps['availability'].sum()
-                total_allocated = df_assign['allocated_hours'].sum() if not df_assign.empty else 0.0
-                utilization = (total_allocated / total_capacity * 100.0) if total_capacity > 0 else 0.0
+            total_capacity = active_emps['availability'].sum()
+            total_allocated = df_assign['allocated_hours'].sum() if not df_assign.empty else 0.0
+            utilization = (total_allocated / total_capacity * 100.0) if total_capacity > 0 else 0.0
 
-                role_match_rate = df_assign['role_match'].mean() if not df_assign.empty else 0.0
-                avg_delay = df_assign['delay_factor'].mean() if not df_assign.empty else 1.0
+            role_match_rate = df_assign['role_match'].mean() if not df_assign.empty else 0.0
+            avg_delay = df_assign['delay_factor'].mean() if not df_assign.empty else 1.0
 
-                active_count = len(active_emps)
-                contention_index = len(trial_backlog[trial_backlog['status'] == 'Pending']) / active_count if active_count > 0 else 0.0
-                
-                if optimizer_telemetry:
-                    optimizer_telemetry[-1]['time_simulation_post_processing'] = time.perf_counter() - t_post_start
+            active_count = len(active_emps)
+            contention_index = len(trial_backlog[trial_backlog['status'] == 'Pending']) / active_count if active_count > 0 else 0.0
 
-                all_kpis.append({
-                    'Trial': trial + 1,
-                    'Step': step + 1,
-                    'Event': event,
-                    'Utilization (%)': round(utilization, 2),
-                    'Projects Completed': len(trial_backlog[trial_backlog['status'] == 'Completed']),
-                    'Projects Failed/Shelved': len(trial_backlog[trial_backlog['status'] == 'Failed']),
-                    'Active Backlog Size': len(trial_backlog[trial_backlog['status'] == 'Pending']),
-                    'Avg Burnout': round(trial_emps['rolling_fatigue'].mean(), 3),
-                    'Role Match Rate': round(role_match_rate, 2),
-                    'Avg Project Delay (Factor)': round(avg_delay, 2),
-                    'Resource Contention': round(contention_index, 3)
-                })
+            if trial_telemetry:
+                trial_telemetry[-1]['time_simulation_post_processing'] = time.perf_counter() - t_post_start
 
-                if not df_assign.empty:
-                    df_assign['trial'] = trial + 1
-                    df_assign['step'] = step + 1
-                    all_allocations.append(df_assign)
+            trial_kpis.append({
+                'Trial': trial_number + 1,
+                'Step': step + 1,
+                'Event': event,
+                'Utilization (%)': round(utilization, 2),
+                'Projects Completed': len(trial_backlog[trial_backlog['status'] == 'Completed']),
+                'Projects Failed/Shelved': len(trial_backlog[trial_backlog['status'] == 'Failed']),
+                'Active Backlog Size': len(trial_backlog[trial_backlog['status'] == 'Pending']),
+                'Avg Burnout': round(trial_emps['rolling_fatigue'].mean(), 3),
+                'Role Match Rate': round(role_match_rate, 2),
+                'Avg Project Delay (Factor)': round(avg_delay, 2),
+                'Resource Contention': round(contention_index, 3)
+            })
 
-                trial_emps_burnout = trial_emps[['emp_id', 'rolling_fatigue']].copy()
-                trial_emps_burnout['trial'] = trial + 1
-                trial_emps_burnout['step'] = step + 1
-                all_burnouts.append(trial_emps_burnout)
+            if not df_assign.empty:
+                df_assign['trial'] = trial_number + 1
+                df_assign['step'] = step + 1
+                trial_allocations.append(df_assign)
 
-            trial_backlog['trial'] = trial + 1
-            project_history.append(trial_backlog)
+            trial_emps_burnout = trial_emps[['emp_id', 'rolling_fatigue']].copy()
+            trial_emps_burnout['trial'] = trial_number + 1
+            trial_emps_burnout['step'] = step + 1
+            trial_burnouts.append(trial_emps_burnout)
 
-        t_sim_end = time.perf_counter()
-        t_total_simulation = t_sim_end - t_sim_start
+        trial_backlog['trial'] = trial_number + 1
 
-        allocations_final_df = pd.concat(all_allocations, ignore_index=True) if all_allocations else pd.DataFrame()
+        return {
+            "kpis": trial_kpis,
+            "allocations": (pd.concat(trial_allocations, ignore_index=True).to_dict(orient='records')
+                            if trial_allocations else []),
+            "burnout": (pd.concat(trial_burnouts, ignore_index=True).to_dict(orient='records')
+                        if trial_burnouts else []),
+            "project_history": trial_backlog.to_dict(orient='records'),
+            "telemetry": trial_telemetry,
+            "final_employees": trial_emps.to_dict(orient='records'),
+        }
+
+    @staticmethod
+    def aggregate_trial_results(trial_results: List[Dict[str, Any]], t_total_simulation: float) -> Dict[str, Any]:
+        """Combines however-many independently-run trial results into the same
+        response shape run_simulation() used to produce sequentially."""
+        all_kpis, all_allocations, all_burnouts, all_projects, all_telemetry = [], [], [], [], []
+        final_employees = []
+
+        for tr in trial_results:
+            all_kpis.extend(tr.get("kpis", []))
+            all_allocations.extend(tr.get("allocations", []))
+            all_burnouts.extend(tr.get("burnout", []))
+            all_projects.extend(tr.get("project_history", []))
+            all_telemetry.extend(tr.get("telemetry", []))
+
+        if trial_results:
+            final_employees = trial_results[-1].get("final_employees", [])
+
+        allocations_final_df = pd.DataFrame(all_allocations)
         kpis_final_df = pd.DataFrame(all_kpis)
-        burnout_final_df = pd.concat(all_burnouts, ignore_index=True) if all_burnouts else pd.DataFrame()
-        projects_final_df = pd.concat(project_history, ignore_index=True) if project_history else pd.DataFrame()
-        df_telemetry = pd.DataFrame(optimizer_telemetry)
+        burnout_final_df = pd.DataFrame(all_burnouts)
+        projects_final_df = pd.DataFrame(all_projects)
+        df_telemetry = pd.DataFrame(all_telemetry)
+        employees_final_df = pd.DataFrame(final_employees)
 
         performance_summary = {}
         if not df_telemetry.empty:
             total_opt_time = df_telemetry["time_total_optimizer"].sum()
             total_solver_time = df_telemetry["time_solver_execution"].sum()
             total_post_time = df_telemetry.get("time_simulation_post_processing", pd.Series([0.0])).sum() + df_telemetry["time_solution_extraction"].sum()
-            
+
             total_build_time = (
-                df_telemetry["time_model_build"].sum() + 
-                df_telemetry["time_candidate_gen_prune"].sum() + 
+                df_telemetry["time_model_build"].sum() +
+                df_telemetry["time_candidate_gen_prune"].sum() +
                 df_telemetry["time_adjacency_build"].sum()
             )
-            
+
             solver_pct = (total_solver_time / t_total_simulation * 100.0) if t_total_simulation > 0 else 0.0
             build_pct = (total_build_time / t_total_simulation * 100.0) if t_total_simulation > 0 else 0.0
-            
+
             performance_summary = {
                 "total_simulation_time": round(t_total_simulation, 4),
                 "total_optimization_time": round(total_opt_time, 4),
@@ -507,22 +538,35 @@ class LivingMonteCarloSimulator:
                 role_match_rate=('role_match', 'mean')
             ).reset_index()
 
-        project_summary_df = projects_final_df.groupby('status').size().reset_index(name='count')
-        simulation_summary_df = kpis_final_df.describe()
+        project_summary_df = (projects_final_df.groupby('status').size().reset_index(name='count')
+                               if not projects_final_df.empty else pd.DataFrame())
+        simulation_summary_df = kpis_final_df.describe() if not kpis_final_df.empty else pd.DataFrame()
 
         return {
-            "allocations": json.loads(allocations_final_df.to_json(orient='records')),
-            "employees": json.loads(trial_emps.to_json(orient='records')),
-            "projects": json.loads(projects_final_df.to_json(orient='records')),
-            "kpis": json.loads(kpis_final_df.to_json(orient='records')),
-            "burnout": json.loads(burnout_final_df.to_json(orient='records')),
+            "allocations": json.loads(allocations_final_df.to_json(orient='records')) if not allocations_final_df.empty else [],
+            "employees": json.loads(employees_final_df.to_json(orient='records')) if not employees_final_df.empty else [],
+            "projects": json.loads(projects_final_df.to_json(orient='records')) if not projects_final_df.empty else [],
+            "kpis": json.loads(kpis_final_df.to_json(orient='records')) if not kpis_final_df.empty else [],
+            "burnout": json.loads(burnout_final_df.to_json(orient='records')) if not burnout_final_df.empty else [],
             "departments": json.loads(dept_summary_df.to_json(orient='records')) if not dept_summary_df.empty else [],
-            "project_summary": json.loads(project_summary_df.to_json(orient='records')),
-            "simulation_summary": json.loads(simulation_summary_df.to_json(orient='index')),
-            
+            "project_summary": json.loads(project_summary_df.to_json(orient='records')) if not project_summary_df.empty else [],
+            "simulation_summary": json.loads(simulation_summary_df.to_json(orient='index')) if not simulation_summary_df.empty else {},
             "performance_summary": performance_summary,
             "performance_details": json.loads(df_telemetry.to_json(orient='records')) if not df_telemetry.empty else []
         }
+
+    def run_simulation(self) -> Dict[str, Any]:
+        """Sequential local/CLI path - runs every trial in-process, one after another,
+        then aggregates. Used by the __main__ entrypoint below and by the Modal
+        orchestrator's cheap seed-generation step."""
+        t_sim_start = time.perf_counter()
+        trial_seeds = self.generate_trial_seeds()
+        trial_results = [
+            self.run_single_trial(trial_number=t, trial_seed=trial_seeds[t])
+            for t in range(self.cfg.trials)
+        ]
+        t_total_simulation = time.perf_counter() - t_sim_start
+        return self.aggregate_trial_results(trial_results, t_total_simulation)
 
 # ==========================================
 # 3. INTERACTIVE CLI ENTRYPOINT
