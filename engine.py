@@ -47,7 +47,7 @@ class SimulationConfig:
 class WorkforceOptimizer:
     """
     Enterprise sparse MILP Optimizer instrumented with high-resolution 
-    performance diagnostics and model structure metrics.
+    performance diagnostics and vectorized candidate generation.
     """
     def __init__(self, employees_df: pd.DataFrame, backlog_df: pd.DataFrame, top_k_multiplier: int = 4):
         self.employees_df = employees_df.copy()
@@ -62,9 +62,6 @@ class WorkforceOptimizer:
             self.metrics = {"time_total_optimizer": time.perf_counter() - t_total_start}
             return pd.DataFrame(), []
 
-        # Setup random generators
-        rng = np.random.default_rng(trial_seed)
-        
         df_proj = self.backlog_df.copy()
         df_proj['score'] = df_proj['priority'] * df_proj['urgency']
         df_proj = df_proj.sort_values(by='score', ascending=False)
@@ -89,37 +86,59 @@ class WorkforceOptimizer:
         }
 
         # ------------------------------------------
-        # METRIC STAGE 1: CANDIDATE SELECTION & PRUNING
+        # METRIC STAGE 1: VECTORIZED CANDIDATE SELECTION & PRUNING
         # ------------------------------------------
         t_cand_start = time.perf_counter()
+        
+        # 1. Extract raw contiguous arrays directly from DataFrames to bypass loop dictionary mapping
+        emp_avails_arr = self.employees_df['availability'].to_numpy()
+        emp_roles_arr = self.employees_df['role'].to_numpy()
+        emp_effs_arr = self.employees_df['efficiency'].to_numpy()
+        emp_fatigue_arr = self.employees_df['rolling_fatigue'].to_numpy()
+
+        proj_roles_arr = df_proj['required_role'].to_numpy()
+        proj_min_staff_arr = df_proj['min_staff'].to_numpy()
+        proj_priority_arr = df_proj['priority'].to_numpy()
+        proj_scores_arr = df_proj['score'].to_numpy()
+        proj_complexity_arr = df_proj['complexity'].to_numpy()
+        
+        # Vectorized generation of project hours matching baseline truncation rounding
+        proj_hours_arr = BASE_HOURS_PER_PROJECT + (10 * (proj_complexity_arr - 1.0)).astype(int)
+
+        # 2. Construct 2D Broad Matrices (Axis 0: Employees, Axis 1: Projects)
+        avail_mask = (emp_avails_arr[:, None] > 0) & (emp_avails_arr[:, None] >= proj_hours_arr[None, :])
+        role_match_mask = (emp_roles_arr[:, None] == proj_roles_arr[None, :])
+        cross_role_allowed = (proj_priority_arr[None, :] >= 3)
+        
+        eligible_mask = avail_mask & (role_match_mask | cross_role_allowed)
+
+        # 3. Vectorized Utility Matrix Scoring Calculations
+        role_modifier = np.where(role_match_mask, 1.0, CROSS_ROLE_PENALTY)
+        fatigue_modifier = 1.0 - (0.1 * emp_fatigue_arr[:, None])
+        utility_matrix = proj_scores_arr[None, :] * emp_effs_arr[:, None] * role_modifier * fatigue_modifier
+
         valid_pairs = []
         utility = {}
         
-        for j in proj_ids:
-            project_candidates = []
-            min_required = proj_min_staff[j]
-            
-            for i in emp_ids:
-                if emp_avails[i] <= 0 or emp_avails[i] < proj_hours[j]:
-                    continue
+        # 4. Column-wise Truncation and Pruning Map Build
+        for idx, j in enumerate(proj_ids):
+            valid_indices = np.where(eligible_mask[:, idx])[0]
+            if len(valid_indices) == 0:
+                continue
                 
-                is_match = (emp_roles[i] == proj_roles[j])
-                if not is_match and proj_priority[j] < 3:
-                    continue
-                
-                role_modifier = 1.0 if is_match else CROSS_ROLE_PENALTY
-                fatigue_modifier = 1.0 - (0.1 * emp_fatigue[i])
-                pair_utility = proj_scores[j] * emp_effs[i] * role_modifier * fatigue_modifier
-                
-                project_candidates.append((pair_utility, i))
+            # Extract scores for valid indices and sort using stable argsort to preserve row ties
+            utils = utility_matrix[valid_indices, idx]
+            sorted_order = np.argsort(-utils, kind='stable')
+            sorted_valid_indices = valid_indices[sorted_order]
             
-            project_candidates.sort(key=lambda x: x[0], reverse=True)
-            max_candidates = min_required * self.top_k_multiplier
-            truncated_candidates = project_candidates[:max_candidates]
+            max_candidates = proj_min_staff_arr[idx] * self.top_k_multiplier
+            truncated_indices = sorted_valid_indices[:max_candidates]
             
-            for pair_utility, i in truncated_candidates:
+            for emp_idx in truncated_indices:
+                i = emp_ids[emp_idx]
                 valid_pairs.append((i, j))
-                utility[i, j] = pair_utility
+                utility[i, j] = float(utility_matrix[emp_idx, idx])
+                
         t_cand_end = time.perf_counter()
 
         if not valid_pairs:
