@@ -32,6 +32,7 @@ class SimulationConfig:
     retirement_rate: float = 0.01
     experience_growth_rate: float = 0.05
     promotion_threshold: float = 5.0
+    top_k_multiplier: int = 4 
 
     @classmethod
     def from_dict(cls, data: dict) -> 'SimulationConfig':
@@ -41,24 +42,29 @@ class SimulationConfig:
         return cls(**filtered_data)
 
 # ==========================================
-# 1. OPTIMIZATION ENGINE (MILP IMPLEMENTATION)
+# 1. OPTIMIZATION ENGINE (INSTRUMENTED MILP)
 # ==========================================
 class WorkforceOptimizer:
     """
-    MILP Optimizer utilizing PuLP to allocate workers to a persistent backlog queue.
+    Enterprise sparse MILP Optimizer instrumented with high-resolution 
+    performance diagnostics and model structure metrics.
     """
-    def __init__(self, employees_df: pd.DataFrame, backlog_df: pd.DataFrame):
+    def __init__(self, employees_df: pd.DataFrame, backlog_df: pd.DataFrame, top_k_multiplier: int = 4):
         self.employees_df = employees_df.copy()
         self.backlog_df = backlog_df.copy()
+        self.top_k_multiplier = top_k_multiplier
+        self.metrics: Dict[str, Any] = {}
 
     def run_allocation(self, trial_seed: Optional[int] = None) -> Tuple[pd.DataFrame, List[str]]:
+        t_total_start = time.perf_counter()
+        
         if self.employees_df.empty or self.backlog_df.empty:
+            self.metrics = {"time_total_optimizer": time.perf_counter() - t_total_start}
             return pd.DataFrame(), []
 
         # Setup random generators
         rng = np.random.default_rng(trial_seed)
         
-        # Prepare lookup objects for fast vectorized iteration
         df_proj = self.backlog_df.copy()
         df_proj['score'] = df_proj['priority'] * df_proj['urgency']
         df_proj = df_proj.sort_values(by='score', ascending=False)
@@ -66,68 +72,119 @@ class WorkforceOptimizer:
         emp_ids = self.employees_df['emp_id'].tolist()
         proj_ids = df_proj['project_id'].tolist()
 
-        # Extract worker parameters for lookup
         emp_roles = self.employees_df.set_index('emp_id')['role'].to_dict()
         emp_avails = self.employees_df.set_index('emp_id')['availability'].to_dict()
         emp_effs = self.employees_df.set_index('emp_id')['efficiency'].to_dict()
         emp_fatigue = self.employees_df.set_index('emp_id')['rolling_fatigue'].to_dict()
 
-        # Extract project parameters for lookup
         proj_roles = df_proj.set_index('project_id')['required_role'].to_dict()
         proj_min_staff = df_proj.set_index('project_id')['min_staff'].to_dict()
         proj_complexity = df_proj.set_index('project_id')['complexity'].to_dict()
         proj_scores = df_proj.set_index('project_id')['score'].to_dict()
         proj_priority = df_proj.set_index('project_id')['priority'].to_dict()
 
-        # 1. Decision Variables
-        prob = pulp.LpProblem("Workforce_Allocation_Optimization", pulp.LpMaximize)
-        x = pulp.LpVariable.dicts("assign", ((i, j) for i in emp_ids for j in proj_ids), cat=pulp.LpBinary)
-        shortfall = pulp.LpVariable.dicts("shortfall", proj_ids, lowBound=0, cat=pulp.LpInteger)
+        proj_hours = {
+            j: BASE_HOURS_PER_PROJECT + int(10 * (proj_complexity[j] - 1.0)) 
+            for j in proj_ids
+        }
 
-        # 2. Compute Utility & Penalty Matrices
+        # ------------------------------------------
+        # METRIC STAGE 1: CANDIDATE SELECTION & PRUNING
+        # ------------------------------------------
+        t_cand_start = time.perf_counter()
+        valid_pairs = []
         utility = {}
-        for i in emp_ids:
-            for j in proj_ids:
+        
+        for j in proj_ids:
+            project_candidates = []
+            min_required = proj_min_staff[j]
+            
+            for i in emp_ids:
+                if emp_avails[i] <= 0 or emp_avails[i] < proj_hours[j]:
+                    continue
+                
                 is_match = (emp_roles[i] == proj_roles[j])
+                if not is_match and proj_priority[j] < 3:
+                    continue
+                
                 role_modifier = 1.0 if is_match else CROSS_ROLE_PENALTY
                 fatigue_modifier = 1.0 - (0.1 * emp_fatigue[i])
+                pair_utility = proj_scores[j] * emp_effs[i] * role_modifier * fatigue_modifier
                 
-                # Base Utility calculation
-                utility[i, j] = proj_scores[j] * emp_effs[i] * role_modifier * fatigue_modifier
+                project_candidates.append((pair_utility, i))
+            
+            project_candidates.sort(key=lambda x: x[0], reverse=True)
+            max_candidates = min_required * self.top_k_multiplier
+            truncated_candidates = project_candidates[:max_candidates]
+            
+            for pair_utility, i in truncated_candidates:
+                valid_pairs.append((i, j))
+                utility[i, j] = pair_utility
+        t_cand_end = time.perf_counter()
 
-        # 3. Objective Function Formulation
+        if not valid_pairs:
+            self.metrics = {"time_total_optimizer": time.perf_counter() - t_total_start}
+            return pd.DataFrame(), []
+
+        # ------------------------------------------
+        # METRIC STAGE 2: ADJACENCY MAP BUILDING
+        # ------------------------------------------
+        t_adj_start = time.perf_counter()
+        emp_to_projs = {i: [] for i in emp_ids}
+        proj_to_emps = {j: [] for j in proj_ids}
+        
+        for (i, j) in valid_pairs:
+            emp_to_projs[i].append(j)
+            proj_to_emps[j].append(i)
+        t_adj_end = time.perf_counter()
+
+        # ------------------------------------------
+        # METRIC STAGE 3: MILP CONSTRAINTS FORMULATION
+        # ------------------------------------------
+        t_build_start = time.perf_counter()
+        prob = pulp.LpProblem("Workforce_Allocation_Optimization", pulp.LpMaximize)
+        x = pulp.LpVariable.dicts("assign", valid_pairs, cat=pulp.LpBinary)
+        shortfall = pulp.LpVariable.dicts("shortfall", proj_ids, lowBound=0, cat=pulp.LpInteger)
+
         prob += (
-            pulp.lpSum(utility[i, j] * x[i, j] for i in emp_ids for j in proj_ids) - 
+            pulp.lpSum(utility[i, j] * x[i, j] for (i, j) in valid_pairs) - 
             pulp.lpSum(shortfall[j] * (50.0 * proj_scores[j]) for j in proj_ids)
         )
 
-        # 4. Constraints Formulation
-        # A. Worker hour limits
         for i in emp_ids:
-            prob += pulp.lpSum(
-                (BASE_HOURS_PER_PROJECT + int(10 * (proj_complexity[j] - 1.0))) * x[i, j] 
-                for j in proj_ids
-            ) <= emp_avails[i]
+            allocated_projects = emp_to_projs[i]
+            if allocated_projects:
+                prob += pulp.lpSum(proj_hours[j] * x[i, j] for j in allocated_projects) <= emp_avails[i]
 
-        # B. Concurrency limit (Max 2 projects per step)
         for i in emp_ids:
-            prob += pulp.lpSum(x[i, j] for j in proj_ids) <= MAX_CONCURRENT_PROJECTS
+            allocated_projects = emp_to_projs[i]
+            if allocated_projects:
+                prob += pulp.lpSum(x[i, j] for j in allocated_projects) <= MAX_CONCURRENT_PROJECTS
 
-        # C. Staffing Bounds (Brooks' Law Ceiling & Slack Shortfalls)
         for j in proj_ids:
-            prob += pulp.lpSum(x[i, j] for i in emp_ids) + shortfall[j] >= proj_min_staff[j]
-            prob += pulp.lpSum(x[i, j] for i in emp_ids) <= (proj_min_staff[j] + 2)
+            eligible_workers = proj_to_emps[j]
+            prob += pulp.lpSum(x[i, j] for i in eligible_workers) + shortfall[j] >= proj_min_staff[j]
+            prob += pulp.lpSum(x[i, j] for i in eligible_workers) <= (proj_min_staff[j] + 2)
+        t_build_end = time.perf_counter()
 
-        # Solve MILP
+        # ------------------------------------------
+        # METRIC STAGE 4: CBC SOLVER EXECUTION
+        # ------------------------------------------
+        t_solve_start = time.perf_counter()
         solver = pulp.PULP_CBC_CMD(msg=False, timeLimit=5)
         status = prob.solve(solver)
+        t_solve_end = time.perf_counter()
 
+        # ------------------------------------------
+        # METRIC STAGE 5: RESULT MATRIX EXTRACTION
+        # ------------------------------------------
+        t_extract_start = time.perf_counter()
         assignments = []
         completed_ids = []
 
         if pulp.LpStatus[status] == "Optimal":
             for j in proj_ids:
-                allocated_workers = [i for i in emp_ids if x[i, j].varValue == 1]
+                allocated_workers = [i for i in proj_to_emps[j] if x[i, j].varValue == 1]
                 staff_count = len(allocated_workers)
                 
                 if staff_count > 0:
@@ -138,7 +195,7 @@ class WorkforceOptimizer:
                     completed_ids.append(j)
                     
                     for i in allocated_workers:
-                        allocated_h = BASE_HOURS_PER_PROJECT + int(10 * (proj_complexity[j] - 1.0))
+                        allocated_h = proj_hours[j]
                         is_match = (emp_roles[i] == proj_roles[j])
                         role_mod = 1.0 if is_match else CROSS_ROLE_PENALTY
                         fatigue_mod = 1.0 - (0.1 * emp_fatigue[i])
@@ -155,6 +212,34 @@ class WorkforceOptimizer:
                             'priority': proj_priority[j],
                             'role': emp_roles[i]
                         })
+        t_extract_end = time.perf_counter()
+        t_total_end = time.perf_counter()
+
+        # Structural Statistics Calculations
+        total_employees = len(emp_ids)
+        total_projects = len(proj_ids)
+        original_search_space = total_employees * total_projects
+        pairs_after_pruning = len(valid_pairs)
+        reduction_pct = ((original_search_space - pairs_after_pruning) / original_search_space * 100.0) if original_search_space > 0 else 0.0
+
+        # Save comprehensive performance analytics footprint
+        self.metrics = {
+            "time_candidate_gen_prune": t_cand_end - t_cand_start,
+            "time_adjacency_build": t_adj_end - t_adj_start,
+            "time_model_build": t_build_end - t_build_start,
+            "time_solver_execution": t_solve_end - t_solve_start,
+            "time_solution_extraction": t_extract_end - t_extract_start,
+            "time_total_optimizer": t_total_end - t_total_start,
+            "stat_total_employees": total_employees,
+            "stat_total_projects": total_projects,
+            "stat_original_search_space": original_search_space,
+            "stat_candidate_pairs_after_pruning": pairs_after_pruning,
+            "stat_variables_created": len(prob.variables()),
+            "stat_constraints_created": len(prob.constraints),
+            "stat_variable_reduction_pct": round(reduction_pct, 2),
+            "stat_avg_candidates_per_project": round(pairs_after_pruning / total_projects, 2) if total_projects > 0 else 0.0,
+            "stat_avg_candidates_per_employee": round(pairs_after_pruning / total_employees, 2) if total_employees > 0 else 0.0
+        }
 
         return pd.DataFrame(assignments), completed_ids
 
@@ -163,10 +248,9 @@ class WorkforceOptimizer:
 # ==========================================
 class LivingMonteCarloSimulator:
     """
-    Stateful Simulator containing the persistent workforce and project backlogs.
+    Stateful Simulator collecting execution traces and performance summary statistics.
     """
     def __init__(self, config: Any):
-        # Allow instantiation via direct object or raw configuration dictionary
         if isinstance(config, dict):
             self.cfg = SimulationConfig.from_dict(config)
         else:
@@ -254,11 +338,13 @@ class LivingMonteCarloSimulator:
         return pd.concat([emps, new_hires], ignore_index=True)
 
     def run_simulation(self) -> Dict[str, Any]:
-        """Runs the simulation loops and builds a web-safe, JSON-serializable structure."""
+        t_sim_start = time.perf_counter()
+        
         all_allocations = []
         all_kpis = []
         all_burnouts = []
         project_history = []
+        optimizer_telemetry = []
         
         init_emps = self._generate_workforce(self.cfg.initial_employees)
         init_backlog = self._generate_backlog(self.cfg.initial_projects)
@@ -285,8 +371,19 @@ class LivingMonteCarloSimulator:
                 elif event == 'Crunch Culture Spike':
                     trial_backlog['urgency'] = np.minimum(trial_backlog['urgency'] + 1, 3)
 
-                optimizer = WorkforceOptimizer(active_emps, trial_backlog[trial_backlog['status'] != 'Completed'])
+                optimizer = WorkforceOptimizer(
+                    active_emps, 
+                    trial_backlog[trial_backlog['status'] != 'Completed'],
+                    top_k_multiplier=self.cfg.top_k_multiplier
+                )
                 df_assign, completed_ids = optimizer.run_allocation(trial_seed=trial_seed + step)
+
+                # Capture performance analytics snapshot from optimizer context
+                if optimizer.metrics:
+                    step_metrics = optimizer.metrics.copy()
+                    step_metrics['trial'] = trial + 1
+                    step_metrics['step'] = step + 1
+                    optimizer_telemetry.append(step_metrics)
 
                 if not df_assign.empty:
                     work_done = df_assign.groupby('project_id')['effective_output_hours'].sum().to_dict()
@@ -303,6 +400,7 @@ class LivingMonteCarloSimulator:
                 failed_mask = (trial_backlog['deadline_days'] <= 0) & (trial_backlog['status'] != 'Completed')
                 trial_backlog.loc[failed_mask, 'status'] = 'Failed'
 
+                t_post_start = time.perf_counter()
                 trial_emps = self._process_workforce_evolution(trial_emps, df_assign, trial_rng)
 
                 if step % self.cfg.hiring_interval_steps == 0:
@@ -321,6 +419,10 @@ class LivingMonteCarloSimulator:
 
                 active_count = len(active_emps)
                 contention_index = len(trial_backlog[trial_backlog['status'] == 'Pending']) / active_count if active_count > 0 else 0.0
+                
+                # Update diagnostic list with post-processing runtime metrics
+                if optimizer_telemetry:
+                    optimizer_telemetry[-1]['time_simulation_post_processing'] = time.perf_counter() - t_post_start
 
                 all_kpis.append({
                     'Trial': trial + 1,
@@ -349,11 +451,48 @@ class LivingMonteCarloSimulator:
             trial_backlog['trial'] = trial + 1
             project_history.append(trial_backlog)
 
-        # Aggregation Phase
+        t_sim_end = time.perf_counter()
+        t_total_simulation = t_sim_end - t_sim_start
+
+        # ------------------------------------------
+        # AGGREGATION & SYSTEM BENCHMARK GENERATION
+        # ------------------------------------------
         allocations_final_df = pd.concat(all_allocations, ignore_index=True) if all_allocations else pd.DataFrame()
         kpis_final_df = pd.DataFrame(all_kpis)
         burnout_final_df = pd.concat(all_burnouts, ignore_index=True) if all_burnouts else pd.DataFrame()
         projects_final_df = pd.concat(project_history, ignore_index=True) if project_history else pd.DataFrame()
+        df_telemetry = pd.DataFrame(optimizer_telemetry)
+
+        performance_summary = {}
+        if not df_telemetry.empty:
+            total_opt_time = df_telemetry["time_total_optimizer"].sum()
+            total_solver_time = df_telemetry["time_solver_execution"].sum()
+            total_post_time = df_telemetry.get("time_simulation_post_processing", pd.Series([0.0])).sum() + df_telemetry["time_solution_extraction"].sum()
+            
+            # Build time incorporates pairing, graph building, and PuLP compilation loops
+            total_build_time = (
+                df_telemetry["time_model_build"].sum() + 
+                df_telemetry["time_candidate_gen_prune"].sum() + 
+                df_telemetry["time_adjacency_build"].sum()
+            )
+            
+            solver_pct = (total_solver_time / t_total_simulation * 100.0) if t_total_simulation > 0 else 0.0
+            build_pct = (total_build_time / t_total_simulation * 100.0) if t_total_simulation > 0 else 0.0
+            
+            performance_summary = {
+                "total_simulation_time": round(t_total_simulation, 4),
+                "total_optimization_time": round(total_opt_time, 4),
+                "total_model_build_time": round(total_build_time, 4),
+                "total_solver_time": round(total_solver_time, 4),
+                "total_post_processing_time": round(total_post_time, 4),
+                "solver_percentage_of_total_runtime": round(solver_pct, 2),
+                "python_build_percentage_of_total_runtime": round(build_pct, 2),
+                "avg_solve_time_per_cycle": round(df_telemetry["time_solver_execution"].mean(), 4),
+                "avg_variables_created": round(df_telemetry["stat_variables_created"].mean(), 1),
+                "avg_constraints_created": round(df_telemetry["stat_constraints_created"].mean(), 1),
+                "avg_search_space_reduction_pct": round(df_telemetry["stat_variable_reduction_pct"].mean(), 2),
+                "avg_solve_time_per_trial": round(df_telemetry.groupby("trial")["time_solver_execution"].sum().mean(), 4)
+            }
 
         dept_summary_df = pd.DataFrame()
         if not allocations_final_df.empty:
@@ -366,8 +505,6 @@ class LivingMonteCarloSimulator:
         project_summary_df = projects_final_df.groupby('status').size().reset_index(name='count')
         simulation_summary_df = kpis_final_df.describe()
 
-        # Data Serialization Boundary
-        # Using native to_json + json.loads safely resolves all internal NumPy scalar serialization errors
         return {
             "allocations": json.loads(allocations_final_df.to_json(orient='records')),
             "employees": json.loads(trial_emps.to_json(orient='records')),
@@ -376,7 +513,11 @@ class LivingMonteCarloSimulator:
             "burnout": json.loads(burnout_final_df.to_json(orient='records')),
             "departments": json.loads(dept_summary_df.to_json(orient='records')) if not dept_summary_df.empty else [],
             "project_summary": json.loads(project_summary_df.to_json(orient='records')),
-            "simulation_summary": json.loads(simulation_summary_df.to_json(orient='index'))
+            "simulation_summary": json.loads(simulation_summary_df.to_json(orient='index')),
+            
+            # Production Instrumentation Output Objects
+            "performance_summary": performance_summary,
+            "performance_details": json.loads(df_telemetry.to_json(orient='records')) if not df_telemetry.empty else []
         }
 
 # ==========================================
@@ -400,7 +541,6 @@ if __name__ == "__main__":
     print(f"Initializing simulation using config from: {input_path}")
     start_time = time.time()
     
-    # Run the underlying engine
     simulator = LivingMonteCarloSimulator(config=config_payload)
     results = simulator.run_simulation()
     
