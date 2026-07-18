@@ -6,8 +6,8 @@ from typing import Dict, Any
 # Modal automatically builds this image and deploys it to the cloud
 image = (
     modal.Image.debian_slim()
-    .pip_install("pandas", "numpy", "pulp")
-    .run_commands("apt-get update && apt-get install -y glpk-utils") 
+    .pip_install("pandas", "numpy", "pulp", "fastapi[standard]")
+    .run_commands("apt-get update && apt-get install -y glpk-utils")
 )
 
 # Instantiate the Modal App
