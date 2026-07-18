@@ -5,6 +5,7 @@ image = (
     modal.Image.debian_slim()
     .pip_install("pandas", "numpy", "pulp", "fastapi[standard]")
     .run_commands("apt-get update && apt-get install -y glpk-utils")
+    .add_local_python_source("engine")
 )
 app = modal.App("workforce-digital-twin-backend", image=image)
 
