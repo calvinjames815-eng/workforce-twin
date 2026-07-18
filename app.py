@@ -1,7 +1,15 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from engine import LivingMonteCarloSimulator, SimulationConfig
+import requests
+import time
+
+# ==========================================
+# BACKEND API CONFIGURATION
+# ==========================================
+# Replace these strings with your exact permanent public URLs generated during 'modal deploy'
+MODAL_SUBMIT_URL = "https://YOUR_MODAL_USERNAME--workforce-digital-twin-backend-submit-simulation.modal.run"
+MODAL_CHECK_URL = "https://YOUR_MODAL_USERNAME--workforce-digital-twin-backend-check-status.modal.run"
 
 # Set page configuration for enterprise dashboard styling
 st.set_page_config(
@@ -11,10 +19,35 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Initialize Session State to prevent empty screens on first load
+# Initialize Session State tracking parameters
 if "simulation_results" not in st.session_state:
     st.session_state["simulation_results"] = None
-    st.session_state["config_used"] = None
+if "job_id" not in st.session_state:
+    st.session_state["job_id"] = None
+if "job_status" not in st.session_state:
+    st.session_state["job_status"] = None
+if "job_error" not in st.session_state:
+    st.session_state["job_error"] = None
+
+# Helper function to reconstruct JSON objects back into local operational DataFrames
+def parse_backend_results(raw_data: dict) -> dict:
+    parsed = {}
+    record_based_keys = [
+        "allocations", "employees", "projects", "kpis", 
+        "burnout", "departments", "project_summary"
+    ]
+    for key in record_based_keys:
+        if key in raw_data:
+            parsed[key] = pd.DataFrame(raw_data[key])
+        else:
+            parsed[key] = pd.DataFrame()
+            
+    if "simulation_summary" in raw_data:
+        parsed["simulation_summary"] = pd.DataFrame.from_dict(raw_data["simulation_summary"], orient='index')
+    else:
+        parsed["simulation_summary"] = pd.DataFrame()
+        
+    return parsed
 
 # ==========================================
 # SIDEBAR CONTROLS
@@ -37,26 +70,88 @@ st.sidebar.caption("💡 Tip: Toggle Dark/Light mode in the top-right Streamlit 
 col_run, col_reset = st.sidebar.columns(2)
 
 with col_run:
-    if st.button("Run Simulation", type="primary", use_container_width=True):
-        with st.spinner("Executing Hierarchical MILP Portfolio Allocations..."):
-            config = SimulationConfig(
-                trials=trials,
-                steps_per_trial=steps,
-                initial_employees=employees,
-                initial_projects=projects
-            )
-            sim = LivingMonteCarloSimulator(config)
-            
-            # Store results globally in session memory to preserve state during filter changes
-            st.session_state["simulation_results"] = sim.run_simulation()
-            st.session_state["config_used"] = config
-            st.success("Simulation Complete!")
+    # Disable run button if a simulation is actively executing in the background
+    is_running = st.session_state["job_id"] is not None
+    if st.button("Run Simulation", type="primary", use_container_width=True, disabled=is_running):
+        # Reset any previous session parameters before dispatching network tasks
+        st.session_state["simulation_results"] = None
+        st.session_state["job_error"] = None
+        
+        # Package raw slider parameters into web-safe JSON configurations
+        payload = {
+            "trials": trials,
+            "steps_per_trial": steps,
+            "initial_employees": employees,
+            "initial_projects": projects
+        }
+        
+        try:
+            # Asynchronously submit request to the cloud engine infrastructure
+            response = requests.post(MODAL_SUBMIT_URL, json=payload, timeout=10)
+            if response.status_code == 200:
+                data = response.json()
+                st.session_state["job_id"] = data.get("job_id")
+                st.session_state["job_status"] = "PENDING"
+                st.rerun()
+            else:
+                st.session_state["job_error"] = f"Backend API returned status code {response.status_code}."
+        except Exception as e:
+            st.session_state["job_error"] = f"Failed to dispatch job to serverless engine: {str(e)}"
 
 with col_reset:
     if st.button("Reset", type="secondary", use_container_width=True):
         st.session_state["simulation_results"] = None
-        st.session_state["config_used"] = None
+        st.session_state["job_id"] = None
+        st.session_state["job_status"] = None
+        st.session_state["job_error"] = None
         st.rerun()
+
+# ==========================================
+# ASYNCHRONOUS STATE MACHINE MONITOR
+# ==========================================
+# This global block acts as a state controller if a background computation job exists
+if st.session_state["job_id"]:
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Worker Node Telemetry")
+    
+    with st.sidebar.status(f"Job: {st.session_state['job_id'][:8]}...", expanded=True) as status_box:
+        st.write(f"Cluster Status: **{st.session_state['job_status']}**")
+        
+        try:
+            # Poll the check_status endpoint via a secure query parameter string
+            poll_url = f"{MODAL_CHECK_URL}?job_id={st.session_state['job_id']}"
+            poll_response = requests.get(poll_url, timeout=5)
+            
+            if poll_response.status_code == 200:
+                poll_data = poll_response.json()
+                current_status = poll_data.get("status")
+                st.session_state["job_status"] = current_status
+                
+                if current_status == "SUCCESS":
+                    status_box.update(label="✓ Core Calculations Complete!", state="complete", expanded=False)
+                    # Unpack and rebuild DataFrames
+                    st.session_state["simulation_results"] = parse_backend_results(poll_data.get("result", {}))
+                    st.session_state["job_id"] = None  # Clear job identifier to unlock layout interactions
+                    st.rerun()
+                    
+                elif current_status == "FAILED":
+                    status_box.update(label="✕ Distributed Task Failed", state="error", expanded=True)
+                    st.session_state["job_error"] = poll_data.get("error", "Unknown pipeline error.")
+                    st.session_state["job_id"] = None
+                    
+                else:
+                    # Job state is PENDING or RUNNING. Sleep briefly and re-trigger layout pass
+                    time.sleep(2.5)
+                    st.rerun()
+            else:
+                st.session_state["job_error"] = f"Network telemetry error. Status code: {poll_response.status_code}"
+                st.session_state["job_id"] = None
+                st.rerun()
+                
+        except Exception as e:
+            st.session_state["job_error"] = f"Telemetry polling exception: {str(e)}"
+            st.session_state["job_id"] = None
+            st.rerun()
 
 # ==========================================
 # MAIN DASHBOARD INTERFACE
@@ -64,9 +159,19 @@ with col_reset:
 st.title("👥 Enterprise Workforce Digital Twin")
 st.markdown("Mathematical mixed-integer resource allocation, career path progression, and burnout risk modeling.")
 
+# Visual status notifications for error reporting
+if st.session_state["job_error"]:
+    st.error(st.session_state["job_error"])
+
+# Active background workload progress spinner
+if st.session_state["job_id"]:
+    st.info(f"⏳ **Active Serverless Compute:** Running optimization matrix models via distributed workers. Please wait...")
+    st.spinner("Crunching mixed integer linear programming models across Monte Carlo instances...")
+
 # Verify if data exists; if not, show placeholder layout
 if st.session_state["simulation_results"] is None:
-    st.info("👈 Please select your workforce constraints in the sidebar and click 'Run Simulation' to generate analytics.")
+    if not st.session_state["job_id"]:
+        st.info("👈 Please select your workforce constraints in the sidebar and click 'Run Simulation' to generate analytics.")
     
     st.subheader("Interactive Module Blueprint")
     st.image(
@@ -86,7 +191,7 @@ else:
     sim_summary = results.get("simulation_summary", pd.DataFrame())
 
     # ==========================================
-    # OVERVIEW STATUS MATRIX (Top KPI Cards with Division/Aggregation Guards)
+    # OVERVIEW STATUS MATRIX
     # ==========================================
     st.subheader("Global Portfolio Health Matrix")
     
@@ -125,7 +230,7 @@ else:
     ])
 
     # ------------------------------------------
-    # TAB 1: KPI TRENDS (Chart & Numeric Only Safety)
+    # TAB 1: KPI TRENDS
     # ------------------------------------------
     with tab_kpi:
         st.subheader("Portfolio Performance Progression over Time")
@@ -171,7 +276,7 @@ else:
             st.info("No KPI data available to display trends.")
 
     # ------------------------------------------
-    # TAB 2: WORKFORCE DEMOGRAPHICS (Optional Column Safeguards)
+    # TAB 2: WORKFORCE DEMOGRAPHICS
     # ------------------------------------------
     with tab_workforce:
         st.subheader("Worker State Profile (Representative Terminal State)")
@@ -268,7 +373,7 @@ else:
             st.info("No project backlog data available.")
 
     # ------------------------------------------
-    # TAB 4: OPTIMIZED ALLOCATIONS (NaN Safe Filtering)
+    # TAB 4: OPTIMIZED ALLOCATIONS
     # ------------------------------------------
     with tab_allocations:
         st.subheader("Hierarchical MILP Assignment Outputs")
@@ -282,7 +387,6 @@ else:
             
             filtered_allocs = allocs_df
             if search_query:
-                # Defensively secure matches using na=False to safely prevent crashing on missing strings
                 emp_match = filtered_allocs["emp_id"].str.contains(search_query, case=False, na=False) if "emp_id" in filtered_allocs.columns else False
                 proj_match = filtered_allocs["project_id"].str.contains(search_query, case=False, na=False) if "project_id" in filtered_allocs.columns else False
                 filtered_allocs = filtered_allocs[emp_match | proj_match]
@@ -295,7 +399,7 @@ else:
             st.info("No optimizer assignment allocations were captured for this setup.")
 
     # ------------------------------------------
-    # TAB 5: DEPARTMENT METRICS (Numeric Only Safety)
+    # TAB 5: DEPARTMENT METRICS
     # ------------------------------------------
     with tab_departments:
         st.subheader("Departmental Allocation & Output Averages")
