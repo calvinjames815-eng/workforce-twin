@@ -1,0 +1,6 @@
+{
+  "trials": 5,
+  "steps_per_trial": 4,
+  "initial_employees": 50,
+  "initial_projects": 15
+}
