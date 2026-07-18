@@ -4,7 +4,7 @@ import time
 import numpy as np
 import pandas as pd
 import pulp
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, fields, asdict
 from typing import Dict, List, Tuple, Any, Optional
 
 # ==========================================
@@ -37,7 +37,7 @@ class SimulationConfig:
     @classmethod
     def from_dict(cls, data: dict) -> 'SimulationConfig':
         """Safely instantiates configuration from a raw dictionary, filtering out unexpected keys."""
-        valid_keys = {f.name for f in field(cls)}
+        valid_keys = {f.name for f in fields(cls)}
         filtered_data = {k: v for k, v in data.items() if k in valid_keys}
         return cls(**filtered_data)
 
@@ -90,7 +90,6 @@ class WorkforceOptimizer:
         # ------------------------------------------
         t_cand_start = time.perf_counter()
         
-        # 1. Extract raw contiguous arrays directly from DataFrames to bypass loop dictionary mapping
         emp_avails_arr = self.employees_df['availability'].to_numpy()
         emp_roles_arr = self.employees_df['role'].to_numpy()
         emp_effs_arr = self.employees_df['efficiency'].to_numpy()
@@ -102,17 +101,14 @@ class WorkforceOptimizer:
         proj_scores_arr = df_proj['score'].to_numpy()
         proj_complexity_arr = df_proj['complexity'].to_numpy()
         
-        # Vectorized generation of project hours matching baseline truncation rounding
         proj_hours_arr = BASE_HOURS_PER_PROJECT + (10 * (proj_complexity_arr - 1.0)).astype(int)
 
-        # 2. Construct 2D Broad Matrices (Axis 0: Employees, Axis 1: Projects)
         avail_mask = (emp_avails_arr[:, None] > 0) & (emp_avails_arr[:, None] >= proj_hours_arr[None, :])
         role_match_mask = (emp_roles_arr[:, None] == proj_roles_arr[None, :])
         cross_role_allowed = (proj_priority_arr[None, :] >= 3)
         
         eligible_mask = avail_mask & (role_match_mask | cross_role_allowed)
 
-        # 3. Vectorized Utility Matrix Scoring Calculations
         role_modifier = np.where(role_match_mask, 1.0, CROSS_ROLE_PENALTY)
         fatigue_modifier = 1.0 - (0.1 * emp_fatigue_arr[:, None])
         utility_matrix = proj_scores_arr[None, :] * emp_effs_arr[:, None] * role_modifier * fatigue_modifier
@@ -120,13 +116,11 @@ class WorkforceOptimizer:
         valid_pairs = []
         utility = {}
         
-        # 4. Column-wise Truncation and Pruning Map Build
         for idx, j in enumerate(proj_ids):
             valid_indices = np.where(eligible_mask[:, idx])[0]
             if len(valid_indices) == 0:
                 continue
                 
-            # Extract scores for valid indices and sort using stable argsort to preserve row ties
             utils = utility_matrix[valid_indices, idx]
             sorted_order = np.argsort(-utils, kind='stable')
             sorted_valid_indices = valid_indices[sorted_order]
@@ -234,14 +228,12 @@ class WorkforceOptimizer:
         t_extract_end = time.perf_counter()
         t_total_end = time.perf_counter()
 
-        # Structural Statistics Calculations
         total_employees = len(emp_ids)
         total_projects = len(proj_ids)
         original_search_space = total_employees * total_projects
         pairs_after_pruning = len(valid_pairs)
         reduction_pct = ((original_search_space - pairs_after_pruning) / original_search_space * 100.0) if original_search_space > 0 else 0.0
 
-        # Save comprehensive performance analytics footprint
         self.metrics = {
             "time_candidate_gen_prune": t_cand_end - t_cand_start,
             "time_adjacency_build": t_adj_end - t_adj_start,
@@ -397,7 +389,6 @@ class LivingMonteCarloSimulator:
                 )
                 df_assign, completed_ids = optimizer.run_allocation(trial_seed=trial_seed + step)
 
-                # Capture performance analytics snapshot from optimizer context
                 if optimizer.metrics:
                     step_metrics = optimizer.metrics.copy()
                     step_metrics['trial'] = trial + 1
@@ -439,7 +430,6 @@ class LivingMonteCarloSimulator:
                 active_count = len(active_emps)
                 contention_index = len(trial_backlog[trial_backlog['status'] == 'Pending']) / active_count if active_count > 0 else 0.0
                 
-                # Update diagnostic list with post-processing runtime metrics
                 if optimizer_telemetry:
                     optimizer_telemetry[-1]['time_simulation_post_processing'] = time.perf_counter() - t_post_start
 
@@ -473,9 +463,6 @@ class LivingMonteCarloSimulator:
         t_sim_end = time.perf_counter()
         t_total_simulation = t_sim_end - t_sim_start
 
-        # ------------------------------------------
-        # AGGREGATION & SYSTEM BENCHMARK GENERATION
-        # ------------------------------------------
         allocations_final_df = pd.concat(all_allocations, ignore_index=True) if all_allocations else pd.DataFrame()
         kpis_final_df = pd.DataFrame(all_kpis)
         burnout_final_df = pd.concat(all_burnouts, ignore_index=True) if all_burnouts else pd.DataFrame()
@@ -488,7 +475,6 @@ class LivingMonteCarloSimulator:
             total_solver_time = df_telemetry["time_solver_execution"].sum()
             total_post_time = df_telemetry.get("time_simulation_post_processing", pd.Series([0.0])).sum() + df_telemetry["time_solution_extraction"].sum()
             
-            # Build time incorporates pairing, graph building, and PuLP compilation loops
             total_build_time = (
                 df_telemetry["time_model_build"].sum() + 
                 df_telemetry["time_candidate_gen_prune"].sum() + 
@@ -534,7 +520,6 @@ class LivingMonteCarloSimulator:
             "project_summary": json.loads(project_summary_df.to_json(orient='records')),
             "simulation_summary": json.loads(simulation_summary_df.to_json(orient='index')),
             
-            # Production Instrumentation Output Objects
             "performance_summary": performance_summary,
             "performance_details": json.loads(df_telemetry.to_json(orient='records')) if not df_telemetry.empty else []
         }
