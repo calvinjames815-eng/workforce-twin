@@ -8,7 +8,6 @@ import json
 # ==========================================
 # BACKEND API CONFIGURATION
 # ==========================================
-# During local testing, change these to http://localhost:8000/...
 MODAL_SUBMIT_URL = "https://calvinjames815-eng--workforce-digital-twin-backend-submi-a74549.modal.run"
 MODAL_CHECK_URL = "https://calvinjames815-eng--workforce-digital-twin-backend-check-status.modal.run"
 
@@ -28,7 +27,7 @@ if "job_error" not in st.session_state: st.session_state["job_error"] = None
 def parse_backend_results(raw_data: dict) -> dict:
     """Safely reconstructs DataFrames from the backend JSON response."""
     parsed = {}
-    record_based_keys = ["allocations", "employees", "projects", "kpis", "burnout", "departments", "project_summary"]
+    record_based_keys = ["allocations", "employees", "projects", "kpis", "burnout", "departments", "project_summary", "performance_details"]
     
     for key in record_based_keys:
         data = raw_data.get(key, [])
@@ -36,6 +35,8 @@ def parse_backend_results(raw_data: dict) -> dict:
             
     summary_data = raw_data.get("simulation_summary", {})
     parsed["simulation_summary"] = pd.DataFrame.from_dict(summary_data, orient='index') if summary_data else pd.DataFrame()
+
+    parsed["performance_summary"] = raw_data.get("performance_summary", {})
     return parsed
 
 # ==========================================
@@ -101,7 +102,7 @@ if st.session_state["job_id"]:
                     st.session_state["job_error"] = poll_data.get("error", "Unknown error")
                     st.session_state["job_id"] = None
                 else:
-                    time.sleep(2) # Prevent rapid-fire polling
+                    time.sleep(2)
                     st.rerun()
             else:
                 st.session_state["job_error"] = "Polling error."
@@ -120,7 +121,67 @@ if st.session_state["job_error"]:
 
 if st.session_state["simulation_results"]:
     results = st.session_state["simulation_results"]
-    # ... (Your visualization code goes here, same as provided in previous snippets)
+
+    kpis = results["kpis"]
+    allocations = results["allocations"]
+    burnout = results["burnout"]
+    departments = results["departments"]
+    project_summary = results["project_summary"]
+    perf_summary = results["performance_summary"]
+
     st.success("Simulation data loaded.")
+
+    # ---- Top-line KPI cards (latest cycle) ----
+    if not kpis.empty:
+        latest = kpis.iloc[-1]
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Utilization (%)", latest["Utilization (%)"])
+        c2.metric("Projects Completed", int(latest["Projects Completed"]))
+        c3.metric("Avg Burnout", latest["Avg Burnout"])
+        c4.metric("Resource Contention", latest["Resource Contention"])
+
+    tab_kpis, tab_projects, tab_workforce, tab_perf = st.tabs(
+        ["📈 KPI Trends", "📋 Projects", "👷 Workforce", "⚙️ Solver Performance"]
+    )
+
+    with tab_kpis:
+        if not kpis.empty:
+            kpis_indexed = kpis.reset_index(drop=True)
+            kpis_indexed["cycle"] = range(len(kpis_indexed))
+            st.line_chart(kpis_indexed.set_index("cycle")[["Utilization (%)", "Avg Burnout", "Resource Contention"]])
+            st.line_chart(kpis_indexed.set_index("cycle")[["Projects Completed", "Projects Failed/Shelved", "Active Backlog Size"]])
+            with st.expander("Raw KPI table"):
+                st.dataframe(kpis, use_container_width=True)
+        else:
+            st.info("No KPI data returned.")
+
+    with tab_projects:
+        if not project_summary.empty:
+            st.bar_chart(project_summary.set_index("status")["count"])
+        with st.expander("Raw allocations"):
+            st.dataframe(allocations, use_container_width=True)
+
+    with tab_workforce:
+        if not departments.empty:
+            st.subheader("Department / Role Summary")
+            st.dataframe(departments, use_container_width=True)
+        if not burnout.empty:
+            st.subheader("Burnout by cycle")
+            burnout_avg = burnout.groupby(["trial", "step"])["rolling_fatigue"].mean().reset_index()
+            burnout_avg["cycle"] = range(len(burnout_avg))
+            st.line_chart(burnout_avg.set_index("cycle")["rolling_fatigue"])
+        with st.expander("Raw burnout table"):
+            st.dataframe(burnout, use_container_width=True)
+
+    with tab_perf:
+        if perf_summary:
+            p1, p2, p3 = st.columns(3)
+            p1.metric("Total Sim Time (s)", perf_summary.get("total_simulation_time"))
+            p2.metric("Solver % of Runtime", f'{perf_summary.get("solver_percentage_of_total_runtime")}%')
+            p3.metric("Avg Solve Time/Cycle (s)", perf_summary.get("avg_solve_time_per_cycle"))
+            st.json(perf_summary)
+        else:
+            st.info("No performance telemetry returned.")
+
 else:
     st.info("Select parameters and click 'Run Simulation'.")
