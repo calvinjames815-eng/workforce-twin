@@ -9,8 +9,8 @@ import json
 # BACKEND API CONFIGURATION
 # ==========================================
 # During local testing, change these to http://localhost:8000/...
-MODAL_SUBMIT_URL = "https://YOUR_MODAL_USERNAME--workforce-digital-twin-backend-submit-simulation.modal.run"
-MODAL_CHECK_URL = "https://YOUR_MODAL_USERNAME--workforce-digital-twin-backend-check-status.modal.run"
+MODAL_SUBMIT_URL = "https://calvinjames815-eng--workforce-digital-twin-backend-submi-a74549.modal.run"
+MODAL_CHECK_URL = "https://calvinjames815-eng--workforce-digital-twin-backend-check-status.modal.run"
 
 st.set_page_config(page_title="Workforce Digital Twin Dashboard", page_icon="👥", layout="wide")
 
