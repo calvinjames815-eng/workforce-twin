@@ -1,8 +1,10 @@
+import json
+import sys
 import time
 import numpy as np
 import pandas as pd
 import pulp
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Tuple, Any, Optional
 
 # ==========================================
@@ -30,6 +32,13 @@ class SimulationConfig:
     retirement_rate: float = 0.01
     experience_growth_rate: float = 0.05
     promotion_threshold: float = 5.0
+
+    @classmethod
+    def from_dict(cls, data: dict) -> 'SimulationConfig':
+        """Safely instantiates configuration from a raw dictionary, filtering out unexpected keys."""
+        valid_keys = {f.name for f in field(cls)}
+        filtered_data = {k: v for k, v in data.items() if k in valid_keys}
+        return cls(**filtered_data)
 
 # ==========================================
 # 1. OPTIMIZATION ENGINE (MILP IMPLEMENTATION)
@@ -68,7 +77,7 @@ class WorkforceOptimizer:
         proj_min_staff = df_proj.set_index('project_id')['min_staff'].to_dict()
         proj_complexity = df_proj.set_index('project_id')['complexity'].to_dict()
         proj_scores = df_proj.set_index('project_id')['score'].to_dict()
-        proj_priority = df_proj.set_index('project_id')['priority'].to_dict() # FIX: Dict mapping for loop performance
+        proj_priority = df_proj.set_index('project_id')['priority'].to_dict()
 
         # 1. Decision Variables
         prob = pulp.LpProblem("Workforce_Allocation_Optimization", pulp.LpMaximize)
@@ -87,7 +96,6 @@ class WorkforceOptimizer:
                 utility[i, j] = proj_scores[j] * emp_effs[i] * role_modifier * fatigue_modifier
 
         # 3. Objective Function Formulation
-        # Maximize allocation utility minus shortfall penalty
         prob += (
             pulp.lpSum(utility[i, j] * x[i, j] for i in emp_ids for j in proj_ids) - 
             pulp.lpSum(shortfall[j] * (50.0 * proj_scores[j]) for j in proj_ids)
@@ -118,7 +126,6 @@ class WorkforceOptimizer:
         completed_ids = []
 
         if pulp.LpStatus[status] == "Optimal":
-            # Collect results natively
             for j in proj_ids:
                 allocated_workers = [i for i in emp_ids if x[i, j].varValue == 1]
                 staff_count = len(allocated_workers)
@@ -128,7 +135,6 @@ class WorkforceOptimizer:
                     delay_factor = (needed / staff_count) if staff_count > 0 else 2.0
                     eff_penalty = PARTIAL_STAFF_PENALTY if staff_count < needed else 1.0
                     
-                    # Accumulate project deliverables
                     completed_ids.append(j)
                     
                     for i in allocated_workers:
@@ -146,8 +152,8 @@ class WorkforceOptimizer:
                             'effective_output_hours': effective_h,
                             'delay_factor': delay_factor,
                             'role_match': is_match,
-                            'priority': proj_priority[j],  # FIX: Replaced slow runtime .loc with O(1) Dictionary Lookup
-                            'role': emp_roles[i]  # FIX: Directly track role to preserve hired employees in metrics
+                            'priority': proj_priority[j],
+                            'role': emp_roles[i]
                         })
 
         return pd.DataFrame(assignments), completed_ids
@@ -159,8 +165,12 @@ class LivingMonteCarloSimulator:
     """
     Stateful Simulator containing the persistent workforce and project backlogs.
     """
-    def __init__(self, config: SimulationConfig):
-        self.cfg = config
+    def __init__(self, config: Any):
+        # Allow instantiation via direct object or raw configuration dictionary
+        if isinstance(config, dict):
+            self.cfg = SimulationConfig.from_dict(config)
+        else:
+            self.cfg = config
         self.master_rng = np.random.default_rng(101)
 
     def _generate_workforce(self, num_emps: int) -> pd.DataFrame:
@@ -176,7 +186,6 @@ class LivingMonteCarloSimulator:
         })
 
     def _generate_backlog(self, num_projs: int, start_idx: int = 0) -> pd.DataFrame:
-        # FIX: Replaced legacy '.randint' calls with new Generator-compatible '.integers'
         return pd.DataFrame({
             'project_id': [f"P{i}" for i in range(start_idx, start_idx + num_projs)],
             'required_role': self.master_rng.choice(['Backend Eng', 'Frontend Eng'], size=num_projs),
@@ -194,28 +203,23 @@ class LivingMonteCarloSimulator:
     def _process_workforce_evolution(self, emps: pd.DataFrame, assignments_df: pd.DataFrame, step_rng) -> pd.DataFrame:
         df = emps.copy()
         
-        # 1. Calculate and Accumulate Hours Worked
         hours_map = {}
         if not assignments_df.empty:
             hours_map = assignments_df.groupby('emp_id')['allocated_hours'].sum().to_dict()
         df['hours_worked'] = df['emp_id'].map(hours_map).fillna(0.0)
 
-        # 2. Burnout Accumulation and Recovery Formulas (Standardized)
         overtime_hours = df['hours_worked'] - STANDARD_WEEKLY_HOURS
         fatigue_deltas = np.where(overtime_hours > 0, overtime_hours / STANDARD_WEEKLY_HOURS, -0.25)
         df['rolling_fatigue'] = (df['rolling_fatigue'] + fatigue_deltas).clip(0.0, 2.0)
         
-        # Adjust productivity/efficiency dynamically
         df['efficiency'] = df['base_efficiency'] * (1.0 - 0.15 * df['rolling_fatigue'])
 
-        # 3. Career Path Evolution (Experience and Promotion)
         df['experience'] += np.where(df['hours_worked'] > 0, self.cfg.experience_growth_rate, 0.0)
         promoted = df['experience'] >= self.cfg.promotion_threshold
         df.loc[promoted, 'base_efficiency'] *= 1.10
         df.loc[promoted, 'experience'] = 0.0
         df.loc[promoted, 'seniority'] += 0.10
 
-        # 4. Senior Retirements
         retire_prob = np.where(df['seniority'] > self.cfg.retirement_threshold, self.cfg.retirement_rate, 0.0)
         retired = step_rng.random(len(df)) < retire_prob
         df = df[~retired].reset_index(drop=True)
@@ -223,16 +227,12 @@ class LivingMonteCarloSimulator:
         return df
 
     def _intelligent_hiring(self, emps: pd.DataFrame, backlog_df: pd.DataFrame, trial: int, step: int) -> pd.DataFrame:
-        """
-        Calculates role gaps based on the active backlog to intelligently target talent acquisition.
-        """
         if backlog_df.empty:
             return emps
 
         role_demands = backlog_df.groupby('required_role')['min_staff'].sum().to_dict()
         role_supply = emps.groupby('role')['emp_id'].count().to_dict()
         
-        # Compute bottleneck role
         gap_role = 'Backend Eng'
         max_gap = -999
         for r in ['Backend Eng', 'Frontend Eng']:
@@ -245,7 +245,7 @@ class LivingMonteCarloSimulator:
             'emp_id': [f"HIRE_{trial}_{step}_{i}" for i in range(self.cfg.hires_per_batch)],
             'role': [gap_role] * self.cfg.hires_per_batch,
             'availability': OVERTIME_MAX_HOURS,
-            'base_efficiency': 0.8,  # Juniors start slightly lower
+            'base_efficiency': 0.8,
             'efficiency': 0.8,
             'seniority': 0.1,
             'experience': 0.0,
@@ -253,16 +253,13 @@ class LivingMonteCarloSimulator:
         })
         return pd.concat([emps, new_hires], ignore_index=True)
 
-    def run_simulation(self) -> Dict[str, pd.DataFrame]:
-        """
-        Main runner executing the Monte Carlo loops across persistent steps.
-        """
+    def run_simulation(self) -> Dict[str, Any]:
+        """Runs the simulation loops and builds a web-safe, JSON-serializable structure."""
         all_allocations = []
         all_kpis = []
         all_burnouts = []
         project_history = []
         
-        # Initialize master data pools
         init_emps = self._generate_workforce(self.cfg.initial_employees)
         init_backlog = self._generate_backlog(self.cfg.initial_projects)
 
@@ -272,62 +269,49 @@ class LivingMonteCarloSimulator:
             trial_seed = int(self.master_rng.integers(1, 1_000_000))
             trial_rng = np.random.default_rng(trial_seed)
 
-            # Deep copy to maintain state independence per trial
             trial_emps = init_emps.copy()
             trial_backlog = init_backlog.copy()
 
             for step in range(self.cfg.steps_per_trial):
-                # 1. Environmental Chaos and Random Events
                 event = trial_rng.choice(['Normal Operations', 'Systemic Blackout', 'Crunch Culture Spike'], p=[0.75, 0.15, 0.10])
-                
-                # Randomized worker absences using Beta distribution
                 absence_rate = trial_rng.beta(self.cfg.absence_alpha, self.cfg.absence_beta)
                 absent_mask = trial_rng.random(len(trial_emps)) < absence_rate
                 
                 active_emps = trial_emps.copy()
                 active_emps.loc[absent_mask, 'availability'] = 0.0
 
-                # Environmental Modifier Impacts
                 if event == 'Systemic Blackout':
                     active_emps['availability'] = (active_emps['availability'] * 0.75).round()
                 elif event == 'Crunch Culture Spike':
                     trial_backlog['urgency'] = np.minimum(trial_backlog['urgency'] + 1, 3)
 
-                # 2. Run Intelligent Allocation
                 optimizer = WorkforceOptimizer(active_emps, trial_backlog[trial_backlog['status'] != 'Completed'])
                 df_assign, completed_ids = optimizer.run_allocation(trial_seed=trial_seed + step)
 
-                # 3. Calculate Project Progression / Backlog updates
                 if not df_assign.empty:
                     work_done = df_assign.groupby('project_id')['effective_output_hours'].sum().to_dict()
                     trial_backlog['work_completed'] += trial_backlog['project_id'].map(work_done).fillna(0.0)
 
-                    # Mark Delayed items
                     assigned_proj_ids = df_assign['project_id'].unique()
                     delayed_mask = (~trial_backlog['project_id'].isin(assigned_proj_ids)) & (trial_backlog['status'] != 'Completed')
                     trial_backlog.loc[delayed_mask, 'delay_cycles'] += 1
 
-                # Update lifecycle status
                 completed_mask = (trial_backlog['work_completed'] >= trial_backlog['work_required']) & (trial_backlog['status'] != 'Completed')
                 trial_backlog.loc[completed_mask, 'status'] = 'Completed'
 
-                # Progress time constraints
                 trial_backlog['deadline_days'] -= 5
                 failed_mask = (trial_backlog['deadline_days'] <= 0) & (trial_backlog['status'] != 'Completed')
                 trial_backlog.loc[failed_mask, 'status'] = 'Failed'
 
-                # 4. Apply System Dynamics
                 trial_emps = self._process_workforce_evolution(trial_emps, df_assign, trial_rng)
 
                 if step % self.cfg.hiring_interval_steps == 0:
                     trial_emps = self._intelligent_hiring(trial_emps, trial_backlog[trial_backlog['status'] == 'Pending'], trial, step)
 
-                # Generate dynamic scope creep / organic growth
                 new_projs = self._generate_backlog(self.cfg.new_projects_per_step, start_idx=global_proj_idx)
                 global_proj_idx += self.cfg.new_projects_per_step
                 trial_backlog = pd.concat([trial_backlog, new_projs], ignore_index=True)
 
-                # 5. Metric Calculations
                 total_capacity = active_emps['availability'].sum()
                 total_allocated = df_assign['allocated_hours'].sum() if not df_assign.empty else 0.0
                 utilization = (total_allocated / total_capacity * 100.0) if total_capacity > 0 else 0.0
@@ -335,12 +319,9 @@ class LivingMonteCarloSimulator:
                 role_match_rate = df_assign['role_match'].mean() if not df_assign.empty else 0.0
                 avg_delay = df_assign['delay_factor'].mean() if not df_assign.empty else 1.0
 
-                # Resource Contention: Projects needing staff vs. available workforce capacity
-                # FIX: Added a defensive Division-by-Zero check in case the workforce drops to 0
                 active_count = len(active_emps)
                 contention_index = len(trial_backlog[trial_backlog['status'] == 'Pending']) / active_count if active_count > 0 else 0.0
 
-                # Append Logging State
                 all_kpis.append({
                     'Trial': trial + 1,
                     'Step': step + 1,
@@ -365,36 +346,71 @@ class LivingMonteCarloSimulator:
                 trial_emps_burnout['step'] = step + 1
                 all_burnouts.append(trial_emps_burnout)
 
-            # Record final statuses for the trial
             trial_backlog['trial'] = trial + 1
             project_history.append(trial_backlog)
 
-        # ==========================================
-        # MODULE: METRICS, ANALYTICS & EXPORTS
-        # ==========================================
+        # Aggregation Phase
         allocations_final_df = pd.concat(all_allocations, ignore_index=True) if all_allocations else pd.DataFrame()
         kpis_final_df = pd.DataFrame(all_kpis)
         burnout_final_df = pd.concat(all_burnouts, ignore_index=True) if all_burnouts else pd.DataFrame()
         projects_final_df = pd.concat(project_history, ignore_index=True) if project_history else pd.DataFrame()
 
-        # Build Department-level summary aggregated metrics
         dept_summary_df = pd.DataFrame()
         if not allocations_final_df.empty:
-            # FIX: By tracking 'role' during allocation, we bypass the need for a left-merge that drops hired employees
             dept_summary_df = allocations_final_df.groupby(['trial', 'role']).agg(
                 total_hours_allocated=('allocated_hours', 'sum'),
                 avg_output_delivered=('effective_output_hours', 'mean'),
                 role_match_rate=('role_match', 'mean')
             ).reset_index()
 
-        # Compile final consolidated outputs
+        project_summary_df = projects_final_df.groupby('status').size().reset_index(name='count')
+        simulation_summary_df = kpis_final_df.describe()
+
+        # Data Serialization Boundary
+        # Using native to_json + json.loads safely resolves all internal NumPy scalar serialization errors
         return {
-            "allocations": allocations_final_df,
-            "employees": trial_emps,  # Representative slice of the last updated workforce state
-            "projects": projects_final_df,
-            "kpis": kpis_final_df,
-            "burnout": burnout_final_df,
-            "departments": dept_summary_df,
-            "project_summary": projects_final_df.groupby('status').size().reset_index(name='count'),
-            "simulation_summary": kpis_final_df.describe()
+            "allocations": json.loads(allocations_final_df.to_json(orient='records')),
+            "employees": json.loads(trial_emps.to_json(orient='records')),
+            "projects": json.loads(projects_final_df.to_json(orient='records')),
+            "kpis": json.loads(kpis_final_df.to_json(orient='records')),
+            "burnout": json.loads(burnout_final_df.to_json(orient='records')),
+            "departments": json.loads(dept_summary_df.to_json(orient='records')) if not dept_summary_df.empty else [],
+            "project_summary": json.loads(project_summary_df.to_json(orient='records')),
+            "simulation_summary": json.loads(simulation_summary_df.to_json(orient='index'))
         }
+
+# ==========================================
+# 3. INTERACTIVE CLI ENTRYPOINT
+# ==========================================
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Usage: python engine.py <path_to_config.json> [path_to_output.json]")
+        sys.exit(1)
+
+    input_path = sys.argv[1]
+    output_path = sys.argv[2] if len(sys.argv) > 2 else "results.json"
+
+    try:
+        with open(input_path, 'r') as f:
+            config_payload = json.load(f)
+    except Exception as e:
+        print(f"Error reading configuration file: {e}")
+        sys.exit(1)
+
+    print(f"Initializing simulation using config from: {input_path}")
+    start_time = time.time()
+    
+    # Run the underlying engine
+    simulator = LivingMonteCarloSimulator(config=config_payload)
+    results = simulator.run_simulation()
+    
+    elapsed_time = time.time() - start_time
+    print(f"Simulation completed successfully in {elapsed_time:.2f} seconds.")
+
+    try:
+        with open(output_path, 'w') as f:
+            json.dump(results, f, indent=2)
+        print(f"Results exported to: {output_path}")
+    except Exception as e:
+        print(f"Error exporting results to JSON: {e}")
+        sys.exit(1)
