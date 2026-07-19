@@ -3,7 +3,7 @@
 Monte Carlo simulation and mixed-integer optimization for large-scale workforce planning.
 
 **Calvin James B. Demegillo**
-[Live Demo](https://workforce-digital-twin.streamlit.app/) · [GitHub](https://github.com/calvinjames815-eng/workforce-twin) · [LinkedIn](https://www.linkedin.com/in/calvin-james-demegillo-a1169a418/)
+[Live Demo](https://workforce-digital-twin.streamlit.app/) · [GitHub](https://github.com/calvinjames815-eng) · [LinkedIn](https://www.linkedin.com/in/calvin-james-demegillo-a1169a418/)
 
 For an engineering design review of how this system evolved — architectural decisions, tradeoffs, and lessons learned — see [`CASE_STUDY.md`](./CASE_STUDY.md).
 
