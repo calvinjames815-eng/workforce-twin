@@ -3,7 +3,7 @@
 A design review of how a workforce planning simulator evolved from a single-process prototype into a distributed, asynchronous simulation system.
 
 **Calvin James B. Demegillo**
-[Live Demo](https://workforce-digital-twin.streamlit.app/) · [GitHub](https://github.com/calvinjames815-eng/workforce-twin) · [LinkedIn](https://www.linkedin.com/in/calvin-james-demegillo-a1169a418/)
+[Live Demo](https://workforce-digital-twin.streamlit.app/) · [GitHub](https://github.com/calvinjames815-eng) · [LinkedIn](https://www.linkedin.com/in/calvin-james-demegillo-a1169a418/)
 
 ## Executive Summary
 
