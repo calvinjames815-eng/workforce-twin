@@ -8,10 +8,12 @@ import json
 # ==========================================
 # BACKEND API CONFIGURATION
 # ==========================================
+# Preserved existing URLs and appended standard structure for the new GET endpoint
 MODAL_SUBMIT_URL = "https://calvinjames815-eng--workforce-digital-twin-backend-submi-a74549.modal.run"
 MODAL_CHECK_URL = "https://calvinjames815-eng--workforce-digital-twin-backend-check-status.modal.run"
+MODAL_RESULT_URL = "https://calvinjames815-eng--workforce-digital-twin-backend-get-result.modal.run"
 
-st.set_page_config(page_title="Workforce Digital Twin Dashboard", page_icon="👥", layout="wide")
+st.set_page_config(page_title="Workforce Digital Twin Dashboard", page_icon="🧩", layout="wide")
 
 # ==========================================
 # SESSION STATE INITIALIZATION
@@ -25,17 +27,14 @@ if "job_error" not in st.session_state: st.session_state["job_error"] = None
 # HELPERS
 # ==========================================
 def parse_backend_results(raw_data: dict) -> dict:
-    """Safely reconstructs DataFrames from the backend JSON response."""
     parsed = {}
-    record_based_keys = ["allocations", "employees", "projects", "kpis", "burnout", "departments", "project_summary", "performance_details"]
+    # Strictly pull the pre-aggregated payload layout keys
+    record_based_keys = ["allocations", "kpis", "burnout", "departments", "project_summary"]
     
-    for key in record_based_keys:
+   for key in record_based_keys:
         data = raw_data.get(key, [])
         parsed[key] = pd.DataFrame(data) if data else pd.DataFrame()
-            
-    summary_data = raw_data.get("simulation_summary", {})
-    parsed["simulation_summary"] = pd.DataFrame.from_dict(summary_data, orient='index') if summary_data else pd.DataFrame()
-
+       
     parsed["performance_summary"] = raw_data.get("performance_summary", {})
     return parsed
 
@@ -93,19 +92,30 @@ if st.session_state["job_id"]:
                 st.session_state["job_status"] = current_status
                 
                 if current_status == "SUCCESS":
-                    status_box.update(label="Complete!", state="complete")
-                    st.session_state["simulation_results"] = parse_backend_results(poll_data.get("result", {}))
+                    status_box.update(label="Downloading Payload...", state="running")
+                    
+                    # Target endpoint download containing optimized 120 second network timeout
+                    res_key = poll_data.get("result_key")
+                    download_response = requests.get(f"{MODAL_RESULT_URL}?result_key={res_key}", timeout=120)
+                    
+                    if download_response.status_code == 200:
+                        status_box.update(label="Complete!", state="complete")
+                        st.session_state["simulation_results"] = parse_backend_results(download_response.json())
+                    else:
+                        status_box.update(label="Download Error", state="error")
+                        st.session_state["job_error"] = f"Failed to acquire results file: {download_response.status_code} - {download_response.text}"
+                        
                     st.session_state["job_id"] = None
                     st.rerun()
                 elif current_status == "FAILED":
                     status_box.update(label="Failed", state="error")
-                    st.session_state["job_error"] = poll_data.get("error", "Unknown error")
+                    st.session_state["job_error"] = poll_data.get("error", "Unknown error encountered")
                     st.session_state["job_id"] = None
                 else:
                     time.sleep(2)
                     st.rerun()
             else:
-                st.session_state["job_error"] = "Polling error."
+                st.session_state["job_error"] = "Polling transport failure."
                 st.session_state["job_id"] = None
         except Exception as e:
             st.session_state["job_error"] = str(e)
@@ -114,7 +124,7 @@ if st.session_state["job_id"]:
 # ==========================================
 # MAIN DASHBOARD
 # ==========================================
-st.title("👥 Enterprise Workforce Digital Twin")
+st.title("🧩 Enterprise Workforce Digital Twin")
 
 if st.session_state["job_error"]:
     st.error(st.session_state["job_error"])
@@ -141,7 +151,7 @@ if st.session_state["simulation_results"]:
         c4.metric("Resource Contention", latest["Resource Contention"])
 
     tab_kpis, tab_projects, tab_workforce, tab_perf = st.tabs(
-        ["📈 KPI Trends", "📋 Projects", "👷 Workforce", "⚙️ Solver Performance"]
+        ["📈 KPI Trends", "📂 Projects", "👥 Workforce", "⚙️ Solver Performance"]
     )
 
     with tab_kpis:
@@ -158,7 +168,7 @@ if st.session_state["simulation_results"]:
     with tab_projects:
         if not project_summary.empty:
             st.bar_chart(project_summary.set_index("status")["count"])
-        with st.expander("Raw allocations"):
+        with st.expander("Aggregated Allocations Table"):
             st.dataframe(allocations, use_container_width=True)
 
     with tab_workforce:
@@ -167,10 +177,11 @@ if st.session_state["simulation_results"]:
             st.dataframe(departments, use_container_width=True)
         if not burnout.empty:
             st.subheader("Burnout by cycle")
-            burnout_avg = burnout.groupby(["trial", "step"])["rolling_fatigue"].mean().reset_index()
-            burnout_avg["cycle"] = range(len(burnout_avg))
-            st.line_chart(burnout_avg.set_index("cycle")["rolling_fatigue"])
-        with st.expander("Raw burnout table"):
+            # Directly plot without secondary frontend grouping
+            burnout_display = burnout.copy()
+            burnout_display["cycle"] = range(len(burnout_display))
+            st.line_chart(burnout_display.set_index("cycle")["avg_rolling_fatigue"])
+        with st.expander("Aggregated Burnout Table"):
             st.dataframe(burnout, use_container_width=True)
 
     with tab_perf:
