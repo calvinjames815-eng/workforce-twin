@@ -31,13 +31,12 @@ def parse_backend_results(raw_data: dict) -> dict:
     # Strictly pull the pre-aggregated payload layout keys
     record_based_keys = ["allocations", "kpis", "burnout", "departments", "project_summary"]
     
-for key in record_based_keys:
+    for key in record_based_keys:
         data = raw_data.get(key, [])
         parsed[key] = pd.DataFrame(data) if data else pd.DataFrame()
        
     parsed["performance_summary"] = raw_data.get("performance_summary", {})
     return parsed
-
 # ==========================================
 # SIDEBAR
 # ==========================================
