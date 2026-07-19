@@ -4,6 +4,7 @@ import time
 import numpy as np
 import pandas as pd
 import pulp
+import collections
 from dataclasses import dataclass, fields, asdict
 from typing import Dict, List, Tuple, Any, Optional
 
@@ -50,35 +51,37 @@ class WorkforceOptimizer:
     performance diagnostics and vectorized candidate generation.
     """
     def __init__(self, employees_df: pd.DataFrame, backlog_df: pd.DataFrame, top_k_multiplier: int = 4):
-        self.employees_df = employees_df.copy()
-        self.backlog_df = backlog_df.copy()
+        # OPTIMIZATION: Assign by reference to avoid O(N) memory copies. Mutated safely below.
+        self.employees_df = employees_df
+        self.backlog_df = backlog_df
         self.top_k_multiplier = top_k_multiplier
         self.metrics: Dict[str, Any] = {}
 
-    def run_allocation(self, trial_seed: Optional[int] = None) -> Tuple[pd.DataFrame, List[str]]:
+    def run_allocation(self, trial_seed: Optional[int] = None) -> Tuple[List[Dict], List[str]]:
         t_total_start = time.perf_counter()
         
         if self.employees_df.empty or self.backlog_df.empty:
             self.metrics = {"time_total_optimizer": time.perf_counter() - t_total_start}
-            return pd.DataFrame(), []
+            return [], []
 
-        df_proj = self.backlog_df.copy()
-        df_proj['score'] = df_proj['priority'] * df_proj['urgency']
+        # OPTIMIZATION: Avoid deep copy of the DataFrame using .assign
+        df_proj = self.backlog_df.assign(score=self.backlog_df['priority'] * self.backlog_df['urgency'])
         df_proj = df_proj.sort_values(by='score', ascending=False)
 
         emp_ids = self.employees_df['emp_id'].tolist()
         proj_ids = df_proj['project_id'].tolist()
 
-        emp_roles = self.employees_df.set_index('emp_id')['role'].to_dict()
-        emp_avails = self.employees_df.set_index('emp_id')['availability'].to_dict()
-        emp_effs = self.employees_df.set_index('emp_id')['efficiency'].to_dict()
-        emp_fatigue = self.employees_df.set_index('emp_id')['rolling_fatigue'].to_dict()
+        # OPTIMIZATION: Faster dictionary instantiation via dict(zip())
+        emp_roles = dict(zip(self.employees_df['emp_id'], self.employees_df['role']))
+        emp_avails = dict(zip(self.employees_df['emp_id'], self.employees_df['availability']))
+        emp_effs = dict(zip(self.employees_df['emp_id'], self.employees_df['efficiency']))
+        emp_fatigue = dict(zip(self.employees_df['emp_id'], self.employees_df['rolling_fatigue']))
 
-        proj_roles = df_proj.set_index('project_id')['required_role'].to_dict()
-        proj_min_staff = df_proj.set_index('project_id')['min_staff'].to_dict()
-        proj_complexity = df_proj.set_index('project_id')['complexity'].to_dict()
-        proj_scores = df_proj.set_index('project_id')['score'].to_dict()
-        proj_priority = df_proj.set_index('project_id')['priority'].to_dict()
+        proj_roles = dict(zip(df_proj['project_id'], df_proj['required_role']))
+        proj_min_staff = dict(zip(df_proj['project_id'], df_proj['min_staff']))
+        proj_complexity = dict(zip(df_proj['project_id'], df_proj['complexity']))
+        proj_scores = dict(zip(df_proj['project_id'], df_proj['score']))
+        proj_priority = dict(zip(df_proj['project_id'], df_proj['priority']))
 
         proj_hours = {
             j: BASE_HOURS_PER_PROJECT + int(10 * (proj_complexity[j] - 1.0)) 
@@ -90,6 +93,7 @@ class WorkforceOptimizer:
         # ------------------------------------------
         t_cand_start = time.perf_counter()
         
+        # Pre-extract 1D arrays to prevent DataFrame lookups inside the loop
         emp_avails_arr = self.employees_df['availability'].to_numpy()
         emp_roles_arr = self.employees_df['role'].to_numpy()
         emp_effs_arr = self.employees_df['efficiency'].to_numpy()
@@ -103,41 +107,57 @@ class WorkforceOptimizer:
         
         proj_hours_arr = BASE_HOURS_PER_PROJECT + (10 * (proj_complexity_arr - 1.0)).astype(int)
 
-        avail_mask = (emp_avails_arr[:, None] > 0) & (emp_avails_arr[:, None] >= proj_hours_arr[None, :])
-        role_match_mask = (emp_roles_arr[:, None] == proj_roles_arr[None, :])
-        cross_role_allowed = (proj_priority_arr[None, :] >= 3)
-        
-        eligible_mask = avail_mask & (role_match_mask | cross_role_allowed)
-
-        role_modifier = np.where(role_match_mask, 1.0, CROSS_ROLE_PENALTY)
-        fatigue_modifier = 1.0 - (0.1 * emp_fatigue_arr[:, None])
-        utility_matrix = proj_scores_arr[None, :] * emp_effs_arr[:, None] * role_modifier * fatigue_modifier
-
         valid_pairs = []
         utility = {}
         
+        # OPTIMIZATION: Calculate utility dynamically in 1D space instead of creating a 10000x1000 dense matrix
         for idx, j in enumerate(proj_ids):
-            valid_indices = np.where(eligible_mask[:, idx])[0]
+            req_hours = proj_hours_arr[idx]
+            req_role = proj_roles_arr[idx]
+            cross_allowed = proj_priority_arr[idx] >= 3
+
+            avail_mask = emp_avails_arr >= req_hours
+            role_match_mask = emp_roles_arr == req_role
+            
+            if cross_allowed:
+                eligible_mask = avail_mask
+            else:
+                eligible_mask = avail_mask & role_match_mask
+                
+            valid_indices = np.where(eligible_mask)[0]
             if len(valid_indices) == 0:
                 continue
                 
-            utils = utility_matrix[valid_indices, idx]
-            sorted_order = np.argsort(-utils, kind='stable')
-            sorted_valid_indices = valid_indices[sorted_order]
+            v_eff = emp_effs_arr[valid_indices]
+            v_role_match = role_match_mask[valid_indices]
+            v_fatigue = emp_fatigue_arr[valid_indices]
+            
+            v_role_mod = np.where(v_role_match, 1.0, CROSS_ROLE_PENALTY)
+            v_fatigue_mod = 1.0 - (0.1 * v_fatigue)
+            
+            utils = proj_scores_arr[idx] * v_eff * v_role_mod * v_fatigue_mod
             
             max_candidates = proj_min_staff_arr[idx] * self.top_k_multiplier
-            truncated_indices = sorted_valid_indices[:max_candidates]
             
-            for emp_idx in truncated_indices:
+            # OPTIMIZATION: Replace full sort with O(N) argpartition
+            if len(utils) > max_candidates:
+                part_idx = np.argpartition(-utils, max_candidates - 1)[:max_candidates]
+                local_sort = np.argsort(-utils[part_idx], kind='stable')
+                final_idx_in_utils = part_idx[local_sort]
+            else:
+                final_idx_in_utils = np.argsort(-utils, kind='stable')
+                
+            for k in final_idx_in_utils:
+                emp_idx = valid_indices[k]
                 i = emp_ids[emp_idx]
                 valid_pairs.append((i, j))
-                utility[i, j] = float(utility_matrix[emp_idx, idx])
+                utility[i, j] = float(utils[k])
                 
         t_cand_end = time.perf_counter()
 
         if not valid_pairs:
             self.metrics = {"time_total_optimizer": time.perf_counter() - t_total_start}
-            return pd.DataFrame(), []
+            return [], []
 
         # ------------------------------------------
         # METRIC STAGE 2: ADJACENCY MAP BUILDING
@@ -159,25 +179,22 @@ class WorkforceOptimizer:
         x = pulp.LpVariable.dicts("assign", valid_pairs, cat=pulp.LpBinary)
         shortfall = pulp.LpVariable.dicts("shortfall", proj_ids, lowBound=0, cat=pulp.LpInteger)
 
+        # OPTIMIZATION: List comprehensions instead of generators for PuLP constraints
         prob += (
-            pulp.lpSum(utility[i, j] * x[i, j] for (i, j) in valid_pairs) - 
-            pulp.lpSum(shortfall[j] * (50.0 * proj_scores[j]) for j in proj_ids)
+            pulp.lpSum([utility[i, j] * x[i, j] for (i, j) in valid_pairs]) - 
+            pulp.lpSum([shortfall[j] * (50.0 * proj_scores[j]) for j in proj_ids])
         )
 
         for i in emp_ids:
             allocated_projects = emp_to_projs[i]
             if allocated_projects:
-                prob += pulp.lpSum(proj_hours[j] * x[i, j] for j in allocated_projects) <= emp_avails[i]
-
-        for i in emp_ids:
-            allocated_projects = emp_to_projs[i]
-            if allocated_projects:
-                prob += pulp.lpSum(x[i, j] for j in allocated_projects) <= MAX_CONCURRENT_PROJECTS
+                prob += pulp.lpSum([proj_hours[j] * x[i, j] for j in allocated_projects]) <= emp_avails[i]
+                prob += pulp.lpSum([x[i, j] for j in allocated_projects]) <= MAX_CONCURRENT_PROJECTS
 
         for j in proj_ids:
             eligible_workers = proj_to_emps[j]
-            prob += pulp.lpSum(x[i, j] for i in eligible_workers) + shortfall[j] >= proj_min_staff[j]
-            prob += pulp.lpSum(x[i, j] for i in eligible_workers) <= (proj_min_staff[j] + 2)
+            prob += pulp.lpSum([x[i, j] for i in eligible_workers]) + shortfall[j] >= proj_min_staff[j]
+            prob += pulp.lpSum([x[i, j] for i in eligible_workers]) <= (proj_min_staff[j] + 2)
         t_build_end = time.perf_counter()
 
         # ------------------------------------------
@@ -252,7 +269,8 @@ class WorkforceOptimizer:
             "stat_avg_candidates_per_employee": round(pairs_after_pruning / total_employees, 2) if total_employees > 0 else 0.0
         }
 
-        return pd.DataFrame(assignments), completed_ids
+        # OPTIMIZATION: Return raw list of dictionaries to prevent DataFrame creation overhead
+        return assignments, completed_ids
 
 # ==========================================
 # 2. MONTE CARLO SIMULATION ENGINE
@@ -297,12 +315,14 @@ class LivingMonteCarloSimulator:
             'status': 'Pending'
         })
 
-    def _process_workforce_evolution(self, emps: pd.DataFrame, assignments_df: pd.DataFrame, step_rng) -> pd.DataFrame:
-        df = emps.copy()
+    def _process_workforce_evolution(self, emps: pd.DataFrame, assignments: List[Dict], step_rng) -> pd.DataFrame:
+        df = emps
         
-        hours_map = {}
-        if not assignments_df.empty:
-            hours_map = assignments_df.groupby('emp_id')['allocated_hours'].sum().to_dict()
+        # OPTIMIZATION: Process allocations directly from dictionaries using defaultdict
+        hours_map = collections.defaultdict(float)
+        for a in assignments:
+            hours_map[a['emp_id']] += a['allocated_hours']
+            
         df['hours_worked'] = df['emp_id'].map(hours_map).fillna(0.0)
 
         overtime_hours = df['hours_worked'] - STANDARD_WEEKLY_HOURS
@@ -380,20 +400,24 @@ class LivingMonteCarloSimulator:
             absence_rate = trial_rng.beta(self.cfg.absence_alpha, self.cfg.absence_beta)
             absent_mask = trial_rng.random(len(trial_emps)) < absence_rate
 
-            active_emps = trial_emps.copy()
-            active_emps.loc[absent_mask, 'availability'] = 0.0
-
+            # OPTIMIZATION: Mutate arrays in place, then restore, eliminating 10,000-row DataFrame copies every cycle
+            original_avail = trial_emps['availability'].values.copy()
             if event == 'Systemic Blackout':
-                active_emps['availability'] = (active_emps['availability'] * 0.75).round()
-            elif event == 'Crunch Culture Spike':
+                trial_emps['availability'] = (trial_emps['availability'] * 0.75).round()
+            trial_emps.loc[absent_mask, 'availability'] = 0.0
+
+            if event == 'Crunch Culture Spike':
                 trial_backlog['urgency'] = np.minimum(trial_backlog['urgency'] + 1, 3)
 
             optimizer = WorkforceOptimizer(
-                active_emps,
+                trial_emps,
                 trial_backlog[trial_backlog['status'] != 'Completed'],
                 top_k_multiplier=self.cfg.top_k_multiplier
             )
-            df_assign, completed_ids = optimizer.run_allocation(trial_seed=trial_seed + step)
+            assignments, completed_ids = optimizer.run_allocation(trial_seed=trial_seed + step)
+            
+            # Restore original availability state before workforce evolution processing
+            trial_emps['availability'] = original_avail
 
             if optimizer.metrics:
                 step_metrics = optimizer.metrics.copy()
@@ -401,12 +425,19 @@ class LivingMonteCarloSimulator:
                 step_metrics['step'] = step + 1
                 trial_telemetry.append(step_metrics)
 
-            if not df_assign.empty:
-                work_done = df_assign.groupby('project_id')['effective_output_hours'].sum().to_dict()
-                trial_backlog['work_completed'] += trial_backlog['project_id'].map(work_done).fillna(0.0)
+            if assignments:
+                work_done = collections.defaultdict(float)
+                assigned_proj_ids = set()
+                for row in assignments:
+                    work_done[row['project_id']] += row['effective_output_hours']
+                    assigned_proj_ids.add(row['project_id'])
 
-                assigned_proj_ids = df_assign['project_id'].unique()
-                delayed_mask = (~trial_backlog['project_id'].isin(assigned_proj_ids)) & (trial_backlog['status'] != 'Completed')
+                # OPTIMIZATION: Vectorized mapping
+                completed_series = trial_backlog['project_id'].map(work_done).fillna(0.0)
+                trial_backlog['work_completed'] += completed_series
+
+                assigned_arr = trial_backlog['project_id'].isin(list(assigned_proj_ids))
+                delayed_mask = (~assigned_arr) & (trial_backlog['status'] != 'Completed')
                 trial_backlog.loc[delayed_mask, 'delay_cycles'] += 1
 
             completed_mask = (trial_backlog['work_completed'] >= trial_backlog['work_required']) & (trial_backlog['status'] != 'Completed')
@@ -417,7 +448,7 @@ class LivingMonteCarloSimulator:
             trial_backlog.loc[failed_mask, 'status'] = 'Failed'
 
             t_post_start = time.perf_counter()
-            trial_emps = self._process_workforce_evolution(trial_emps, df_assign, trial_rng)
+            trial_emps = self._process_workforce_evolution(trial_emps, assignments, trial_rng)
 
             if step % self.cfg.hiring_interval_steps == 0:
                 trial_emps = self._intelligent_hiring(trial_emps, trial_backlog[trial_backlog['status'] == 'Pending'], trial_number, step)
@@ -426,14 +457,14 @@ class LivingMonteCarloSimulator:
             global_proj_idx += self.cfg.new_projects_per_step
             trial_backlog = pd.concat([trial_backlog, new_projs], ignore_index=True)
 
-            total_capacity = active_emps['availability'].sum()
-            total_allocated = df_assign['allocated_hours'].sum() if not df_assign.empty else 0.0
+            total_capacity = trial_emps['availability'].sum()
+            total_allocated = sum(a['allocated_hours'] for a in assignments) if assignments else 0.0
             utilization = (total_allocated / total_capacity * 100.0) if total_capacity > 0 else 0.0
 
-            role_match_rate = df_assign['role_match'].mean() if not df_assign.empty else 0.0
-            avg_delay = df_assign['delay_factor'].mean() if not df_assign.empty else 1.0
+            role_match_rate = sum(a['role_match'] for a in assignments) / len(assignments) if assignments else 0.0
+            avg_delay = sum(a['delay_factor'] for a in assignments) / len(assignments) if assignments else 1.0
 
-            active_count = len(active_emps)
+            active_count = len(trial_emps)
             contention_index = len(trial_backlog[trial_backlog['status'] == 'Pending']) / active_count if active_count > 0 else 0.0
 
             if trial_telemetry:
@@ -453,24 +484,25 @@ class LivingMonteCarloSimulator:
                 'Resource Contention': round(contention_index, 3)
             })
 
-            if not df_assign.empty:
-                df_assign['trial'] = trial_number + 1
-                df_assign['step'] = step + 1
-                trial_allocations.append(df_assign)
+            # OPTIMIZATION: Append dicts seamlessly, avoiding DataFrame concatenations completely in loops
+            if assignments:
+                for row in assignments:
+                    row['trial'] = trial_number + 1
+                    row['step'] = step + 1
+                trial_allocations.extend(assignments)
 
-            trial_emps_burnout = trial_emps[['emp_id', 'rolling_fatigue']].copy()
-            trial_emps_burnout['trial'] = trial_number + 1
-            trial_emps_burnout['step'] = step + 1
-            trial_burnouts.append(trial_emps_burnout)
+            burnout_records = trial_emps[['emp_id', 'rolling_fatigue']].to_dict(orient='records')
+            for rec in burnout_records:
+                rec['trial'] = trial_number + 1
+                rec['step'] = step + 1
+            trial_burnouts.extend(burnout_records)
 
         trial_backlog['trial'] = trial_number + 1
 
         return {
             "kpis": trial_kpis,
-            "allocations": (pd.concat(trial_allocations, ignore_index=True).to_dict(orient='records')
-                            if trial_allocations else []),
-            "burnout": (pd.concat(trial_burnouts, ignore_index=True).to_dict(orient='records')
-                        if trial_burnouts else []),
+            "allocations": trial_allocations,
+            "burnout": trial_burnouts,
             "project_history": trial_backlog.to_dict(orient='records'),
             "telemetry": trial_telemetry,
             "final_employees": trial_emps.to_dict(orient='records'),
@@ -542,17 +574,22 @@ class LivingMonteCarloSimulator:
                                if not projects_final_df.empty else pd.DataFrame())
         simulation_summary_df = kpis_final_df.describe() if not kpis_final_df.empty else pd.DataFrame()
 
+        # OPTIMIZATION: Vectorized conversion dropping string overhead via .where(pd.notnull)
+        def safe_to_dict(df: pd.DataFrame) -> List[Dict]:
+            if df.empty: return []
+            return df.where(pd.notnull(df), None).to_dict(orient='records')
+
         return {
-            "allocations": json.loads(allocations_final_df.to_json(orient='records')) if not allocations_final_df.empty else [],
-            "employees": json.loads(employees_final_df.to_json(orient='records')) if not employees_final_df.empty else [],
-            "projects": json.loads(projects_final_df.to_json(orient='records')) if not projects_final_df.empty else [],
-            "kpis": json.loads(kpis_final_df.to_json(orient='records')) if not kpis_final_df.empty else [],
-            "burnout": json.loads(burnout_final_df.to_json(orient='records')) if not burnout_final_df.empty else [],
-            "departments": json.loads(dept_summary_df.to_json(orient='records')) if not dept_summary_df.empty else [],
-            "project_summary": json.loads(project_summary_df.to_json(orient='records')) if not project_summary_df.empty else [],
-            "simulation_summary": json.loads(simulation_summary_df.to_json(orient='index')) if not simulation_summary_df.empty else {},
+            "allocations": safe_to_dict(allocations_final_df),
+            "employees": safe_to_dict(employees_final_df),
+            "projects": safe_to_dict(projects_final_df),
+            "kpis": safe_to_dict(kpis_final_df),
+            "burnout": safe_to_dict(burnout_final_df),
+            "departments": safe_to_dict(dept_summary_df),
+            "project_summary": safe_to_dict(project_summary_df),
+            "simulation_summary": simulation_summary_df.where(pd.notnull(simulation_summary_df), None).to_dict(orient='index') if not simulation_summary_df.empty else {},
             "performance_summary": performance_summary,
-            "performance_details": json.loads(df_telemetry.to_json(orient='records')) if not df_telemetry.empty else []
+            "performance_details": safe_to_dict(df_telemetry)
         }
 
     def run_simulation(self) -> Dict[str, Any]:
