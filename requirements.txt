@@ -1,6 +1,10 @@
-streamlit
-pandas
-numpy
-pulp
-scipy
-plotly
+streamlit>=1.45
+pandas>=2.2
+numpy>=1.26
+pulp>=2.8
+scipy>=1.13
+plotly>=5.24
+requests>=2.32
+fastapi>=0.115
+pydantic>=2.7
+modal>=1.5.3
