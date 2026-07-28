@@ -2,7 +2,7 @@
 
 A design review of how a workforce planning simulator evolved from a single-process prototype into a distributed, asynchronous simulation system.
 
-**Calvin James B. Demegillo**
+**Calvin James B. Demegillo**  
 [Live Demo](https://workforce-digital-twin.streamlit.app/) · [GitHub](https://github.com/calvinjames815-eng) · [LinkedIn](https://www.linkedin.com/in/calvin-james-demegillo-a1169a418/)
 
 ## Executive Summary
@@ -12,6 +12,8 @@ Workforce planning is a decision problem under uncertainty, and most organizatio
 The initial implementation was a single-process Streamlit application that ran simulation, optimization, and aggregation sequentially in one Python process. It worked, and it also failed in a predictable way: runtime scaled linearly with the number of Monte Carlo trials, the UI blocked for the full duration of every run, and the design had no path to handle the trial counts a real planning exercise would require.
 
 The system was redesigned around three principles: separate simulation logic from execution orchestration, distribute independent work instead of looping over it, and move aggregation to the backend so the frontend's cost is bounded by result size, not trial count. The result is an architecture where Monte Carlo trials execute in parallel on a distributed backend, the dashboard polls asynchronously instead of blocking, and payloads are aggregated and compressed before they ever reach the browser.
+
+Subsequent engineering work focused on making the distributed architecture production-ready rather than simply functional. This included introducing API authentication, defensive request validation, resilient asynchronous polling with retry and exponential backoff, deterministic Monte Carlo execution through trial-specific random seeds, mathematically correct aggregation of independent simulation trials, payload compression, and backend-side data reduction to keep frontend memory usage bounded. The result is not only a distributed simulation system, but one engineered around correctness, scalability, and operational robustness.
 
 This document is a design review of that evolution — the problems that forced it, the tradeoffs accepted along the way, and what the architecture can and cannot do today.
 
@@ -37,17 +39,20 @@ Monte Carlo simulation was introduced to answer that second question. Instead of
 
 The first version of the system was intentionally simple: a single `engine.py` module containing simulation and optimization logic, invoked directly by a single Streamlit application. There was no backend service, no job queue, and no separation between computation and presentation.
 
+
 ```
+
 Streamlit process
-  |
-  |-- generate workforce
-  |-- for each Monte Carlo trial (sequential):
-  |       for each planning cycle:
-  |           evolve workforce
-  |           solve MILP
-  |           record telemetry
-  |-- aggregate results in-process
-  |-- render dashboard
+|
+|-- generate workforce
+|-- for each Monte Carlo trial (sequential):
+|        for each planning cycle:
+|            evolve workforce
+|            solve MILP
+|            record telemetry
+|-- aggregate results in-process
+|-- render dashboard
+
 ```
 
 This architecture had one property that made it a reasonable starting point and one property that made it unsustainable. The reasonable property: everything executed in a single process with no network boundary, so there was nothing to debug except the simulation logic itself. The unsustainable property: every Monte Carlo trial ran on the same thread, one after another, and the user's browser tab was blocked for the entire duration.
@@ -64,6 +69,7 @@ Several distinct problems surfaced as trial counts and workforce size increased,
 | Runtime multiplication | Every trial re-solves a MILP at every planning cycle | Total solves = trials × cycles, compounding any per-solve inefficiency |
 | Candidate explosion | No upstream filtering of infeasible employee-project pairs | Constraint matrix grew denser than necessary, slowing presolve and solve |
 | Large payloads | Raw per-trial results held for later aggregation | Memory pressure and slow serialization at higher trial counts |
+| Driver memory exhaustion | Aggregating raw employee-level telemetry from every distributed worker | Potential Out-of-Memory failures despite efficient MILP execution |
 | Frontend memory growth | Aggregation performed in the Streamlit process | Browser tab process footprint grew with trial count, not with result size |
 | Network transfer cost | Uncompressed results moved between components | Higher latency and higher storage cost as result volume grew |
 | Solver scalability | CBC solve time is sensitive to model size and structure | Sequential solves left no way to amortize this cost across trials |
@@ -75,23 +81,26 @@ None of these were solved by a single fix. They required rethinking where comput
 
 The redesign followed a specific sequence, and each step addressed a specific failure mode from the prior architecture rather than being a general-purpose rewrite.
 
+
 ```
+
 Single-process Streamlit
-        |
-        v
+|
+v
 Modal backend introduced  ---------------  decouples execution from the UI process
-        |
-        v
+|
+v
 Parallel trial execution  ---------------  removes the linear runtime-vs-trials relationship
-        |
-        v
+|
+v
 Backend aggregation       ---------------  bounds frontend cost by result size, not trial count
-        |
-        v
+|
+v
 Asynchronous polling       --------------  removes UI blocking during execution
-        |
-        v
+|
+v
 Compressed payloads         -------------  reduces transfer latency and storage cost
+
 ```
 
 **Modal backend.** Moving execution off the Streamlit process was the precondition for everything that followed. As long as simulation ran inside the same process rendering the UI, no amount of internal optimization would fix the blocking problem — the browser tab and the computation were coupled by construction. Introducing a separate execution layer decoupled them, at the cost of introducing a network boundary and the operational complexity that comes with it: job state, polling, and failure handling that did not exist before.
@@ -120,21 +129,44 @@ Distributing execution addressed the *orchestration* cost of running many trials
 
 **Avoiding DataFrame copies.** Pandas operations that implicitly copy data were identified and replaced with in-place or view-based alternatives where correctness allowed it, reducing both memory pressure and the CPU cost of repeated copying in hot paths.
 
-**Performance telemetry.** Solver time, cycle time, and candidate counts are recorded for every trial rather than added only when a performance problem is suspected. The reasoning: in a system where a regression can only be observed indirectly — as a slower dashboard, not a explicit error — instrumentation is what makes the regression visible at all, and it needs to already exist before the regression occurs, not after.
+**Performance telemetry.** Solver time, cycle time, and candidate counts are recorded for every trial rather than added only when a performance problem is suspected. The reasoning: in a system where a regression can only be observed indirectly — as a slower dashboard, not an explicit error — instrumentation is what makes the regression visible at all, and it needs to already exist before the regression occurs, not after.
 
-## 6. Results
+## 6. Reliability and Production Engineering
+
+### API Authentication
+The backend exposes asynchronous simulation endpoints protected through API-key authentication. Every request is validated before computation begins, preventing unauthenticated access to expensive distributed workloads. Rather than embedding credentials inside the application, secrets are injected through the execution environment, allowing the same codebase to run safely in development and production.
+
+### Deterministic Monte Carlo Execution
+Although Monte Carlo simulation is stochastic, reproducibility remains important for debugging and regression testing. Instead of relying on a single global random number generator, the simulator derives deterministic trial-specific seeds from a master generator. This allows identical simulation configurations to reproduce identical results while preserving statistical independence between trials executed concurrently on different workers.
+
+### Asynchronous Job Orchestration
+Simulation requests follow a submit → poll → retrieve workflow. Rather than holding an HTTP connection open while hundreds of trials execute, the frontend submits a job, receives a unique identifier, periodically polls job status, and retrieves results only after completion. This architecture keeps the interface responsive regardless of simulation duration.
+
+### Fault Tolerance
+Distributed systems occasionally experience transient failures caused by cold starts, container recycling, temporary network interruptions, or gateway errors. The frontend distinguishes permanent client-side failures from temporary infrastructure failures. Only transient server failures are retried using exponential backoff, avoiding unnecessary repeated requests while remaining resilient to temporary cloud infrastructure issues.
+
+### Data Contract Validation
+Configuration payloads are validated before execution begins. Unexpected parameters are rejected rather than silently ignored, reducing the possibility of malformed requests propagating through long-running distributed simulations.
+
+### Payload Optimisation
+Raw simulation output is significantly larger than the information required for visualisation. Aggregation therefore occurs inside the backend before transmission to the frontend. Only bounded summary datasets are returned, preventing browser memory consumption from scaling with the number of Monte Carlo trials.
+
+## 7. Results
 
 The architectural changes produced qualitative improvements consistent with their design intent. No formal load-testing benchmarks were conducted, so the results below are described qualitatively rather than with fabricated figures.
 
-- **Frontend memory usage** is materially lower because the browser process now holds aggregated summaries rather than raw per-trial results.
+- **Frontend memory usage** is materially lower because telemetry returned from distributed workers is pre-aggregated before browser delivery, ensuring frontend memory consumption depends on summary statistics rather than employee-level simulation data.
+- **API authentication, request validation, and resilient polling** improve operational robustness without affecting the simulation engine itself.
 - **Monte Carlo trials execute in parallel**, removing the direct linear relationship between trial count and wall-clock runtime that existed in the original design.
 - **The dashboard remains responsive during execution**, since the frontend no longer blocks on simulation and instead polls a job status endpoint.
 - **The architecture is distributed rather than single-process**, which gives it a scaling path — additional backend capacity can absorb larger trial counts — that the original design structurally lacked.
-- **Concerns are cleanly separated**: simulation and optimization logic in `engine.py`, orchestration and API surface in `modal.py`, and presentation in `app.py`. Each can be modified, tested, or replaced with limited impact on the others.
+- **Concerns are cleanly separated**: simulation and optimization logic in `engine.py`, orchestration and API surface in `backend.py`, and presentation in `app.py`. Each can be modified, tested, or replaced with limited impact on the others.
 
-## 7. Lessons Learned
+## 8. Lessons Learned
 
 **Simulation architecture.** Keeping simulation logic free of any dependency on how it is invoked — no references to Streamlit, no references to the API layer — made it possible to move that logic to a distributed backend without rewriting it. Domain logic and execution context should be separable from the start, not separated retroactively.
+
+**Statistical correctness matters in distributed systems.** Distributed aggregation is not purely an engineering concern; it is also a mathematical one. Aggregating Monte Carlo outputs requires preserving statistical meaning as data moves between distributed workers and orchestration services. Optimisations that reduce payload size must not alter the underlying statistics being reported.
 
 **Distributed systems.** Parallelism is only free when units of work are truly independent. The Monte Carlo trial structure made this straightforward here, but it is a property of the problem, not a property of distributed systems in general — most workloads require explicit design work to reach that independence.
 
@@ -152,24 +184,32 @@ The architectural changes produced qualitative improvements consistent with thei
 
 **Schema validation.** Validating configuration and intermediate results at ingestion, rather than allowing malformed data to propagate, meant failures surfaced at their source instead of as a corrupted aggregate several stages downstream.
 
-## 8. Future Work
+## 9. Future Work
 
 The architecture described here is enterprise-*style*, not enterprise-*scale* — it has not been deployed against production organizational data or operated under sustained real-world load. The following areas extend it in that direction:
 
+- **Adaptive candidate selection.** Strategies that diversify employee utilisation while preserving sparse MILP construction.
+- **Distributed telemetry aggregation.** Further reducing orchestration memory for very large simulations by aggregating metrics at the worker boundary before driver collection.
+- **Automated performance benchmarking.** Systematic benchmarks across varying workforce sizes and Monte Carlo trial configurations.
+- **Cloud-native observability.** Implementing standard monitoring, metrics collection, and distributed tracing for cloud-native execution environments.
 - **Distributed optimization.** For MILP instances that exceed practical single-solver solve time, distributing the optimization itself — not just the trials — across workers (e.g., Benders decomposition or column generation) would remove the current constraint that each cycle's MILP is solved on a single node.
 - **Scenario management.** Persisting and comparing named scenarios, rather than treating each simulation as ephemeral, would support the comparative analysis planning teams actually need.
 - **Historical calibration.** Fitting transition probabilities (attrition, promotion, absence) to real historical workforce data rather than assumed distributions would move the model from illustrative to predictive.
 - **Real enterprise data integration.** Connecting to actual HRIS or ERP data sources, with the schema validation and data contract discipline already established, rather than synthetic workforce generation.
 - **Container autoscaling and Kubernetes.** The current backend relies on Modal's managed scaling; a Kubernetes-based deployment would allow more explicit control over resource allocation and cost at higher sustained load.
-- **Cloud deployment hardening.** Authentication, multi-tenant isolation, and cost controls appropriate for a system handling real organizational data, none of which are currently implemented.
+- **Cloud deployment hardening.** Authentication, multi-tenant isolation, and cost controls appropriate for a system handling real organizational data.
 - **GPU acceleration.** Candidate generation and workforce vector updates are numerically dense operations that are plausible GPU offload candidates at larger workforce sizes.
 - **Role hierarchies and skill graphs.** Replacing flat role matching with a structured hierarchy or graph would make eligibility and substitution modeling considerably more realistic.
 - **Reinforcement-learning hiring policies.** Replacing fixed hiring rules with a learned policy is a natural extension once enough calibrated historical data exists to train against.
 
-## 9. Reflection
+## 10. Reflection
 
 The most useful part of building this system was not the optimization model or the simulation logic individually — it was the experience of watching a working, single-process design become the wrong design as scale requirements increased, and having to decide what to change and what to leave alone.
 
 Every architectural change here was a tradeoff, not a strict improvement: distribution added operational complexity in exchange for parallelism; backend aggregation reduced frontend flexibility in exchange for bounded memory growth; asynchronous polling added state management in exchange for a responsive UI. None of these were free, and part of the engineering work was recognizing which costs were acceptable given what the system needed to do.
 
+Another important lesson was that scalability bottlenecks often appeared outside the optimisation algorithm itself. During development, investigation shifted repeatedly from solver performance to orchestration, payload design, asynchronous communication, and memory management. Solving a mathematical optimisation problem efficiently ultimately required engineering the surrounding distributed system just as carefully as the optimisation model itself.
+
 Building this pushed the work past algorithms and into systems: correctness of the MILP formulation mattered, but so did what happened when that formulation had to run thousands of times under a UI that could not afford to block. That combination — getting the model right and getting the system around it right — is the part of the project most directly transferable to production engineering work, and it is the part this case study has tried to make explicit rather than leave implicit in the code.
+
+```
